@@ -1,0 +1,73 @@
+# Builds the Windows and Linux programs on every push to main and publishes them
+# as the rolling "build" release (download links in README.md).
+# Users' programs pick up app code from the repo by themselves; they replace
+# the program from this release only when its build id changes (see build.py).
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: |
+          pip install -r requirements.txt "pyinstaller>=6.10"
+          python build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/AbsoluteQuery.exe
+            dist/build_id.txt
+
+  linux:
+    runs-on: ubuntu-latest
+    # Debian 11 (glibc 2.31): the program then runs on most distros from 2020 on
+    container: python:3.12-bullseye
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends unixodbc
+          pip install -r requirements.txt "pyinstaller>=6.10"
+          python build.py
+          mv dist/AbsoluteQuery dist/AbsoluteQuery-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/AbsoluteQuery-linux
+            dist/build_id.txt
+
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp windows/build_id.txt AbsoluteQuery.exe.build
+          cp linux/build_id.txt AbsoluteQuery-linux.build
+          gh release delete build --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release create build --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
+            --title "AbsoluteQuery" \
+            --notes "Latest build, from commit $GITHUB_SHA. Download AbsoluteQuery.exe (Windows) or AbsoluteQuery-linux (Linux). Installed copies update themselves." \
+            windows/AbsoluteQuery.exe linux/AbsoluteQuery-linux \
+            AbsoluteQuery.exe.build AbsoluteQuery-linux.build
