@@ -30,7 +30,7 @@ APP_FILES = ["absolute_query.py", "connections.py", "excel_ops.py"]
 PROGRAM_FILES = ["launcher.py", "build.py", "requirements.txt"]  # define the build id
 LOCAL = {Path(f).stem for f in APP_FILES}
 # packages pulled in whole (plugins / backends are loaded dynamically)
-COLLECT = ["tksheet", "keyring"]
+COLLECT = ["tksheet", "keyring", "certifi"]
 # insurance for code pushed later: cheap standard-library modules an update might start using
 EXTRA = ["sqlite3", "uuid", "hashlib", "urllib.request", "urllib.parse", "zipfile", "statistics",
          "difflib", "textwrap", "shlex", "subprocess", "webbrowser", "xml.etree.ElementTree",

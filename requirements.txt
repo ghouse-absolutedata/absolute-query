@@ -2,3 +2,4 @@ pyodbc>=5.0
 tksheet>=7.6
 keyring>=25.0   # saved passwords in the OS keychain
 openpyxl>=3.1   # optional: .xlsx import
+certifi         # CA certificates for the launcher's update checks

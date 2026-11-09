@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import traceback
@@ -79,9 +80,24 @@ def write_state(s: dict) -> None:
     os.replace(tmp, STATE)
 
 
+def tls_context() -> ssl.SSLContext:
+    """System CAs plus certifi's. The Linux program is built on Debian and its
+    OpenSSL looks for Debian's CA path, which other distros do not have."""
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except Exception:  # noqa: BLE001 - running from source without certifi
+        pass
+    return ctx
+
+
+TLS = tls_context()
+
+
 def get(url: str, timeout: float = TIMEOUT) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "AbsoluteQuery-launcher"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=timeout, context=TLS) as r:
         return r.read()
 
 
