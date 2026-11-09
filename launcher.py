@@ -25,6 +25,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import threading
 import traceback
 import urllib.request
 import zipfile
@@ -37,7 +38,7 @@ ASSET = "AbsoluteQuery.exe" if os.name == "nt" else "AbsoluteQuery-linux"
 TIMEOUT = 5  # seconds per check; a slow or missing server never blocks start-up for long
 DOWNLOAD_TIMEOUT = 120
 ENTRY = "absolute_query"  # module whose main() is the app
-APP_MODULES = ("absolute_query", "connections", "excel_ops")
+APP_MODULES = ("absolute_query", "connections", "excel_ops", "icons")
 KEEP = 2  # unpacked versions kept: current + previous
 
 
@@ -184,11 +185,36 @@ def update_program(state: dict) -> None:
     sys.exit(0)
 
 
-def update(state: dict) -> None:
+def check_code():
+    """Ask for the latest commit in the background while the program check runs.
+    Returns a function that waits for the answer (or raises its error). A daemon
+    thread, so a program restart does not wait for it."""
     repo = os.environ.get("ABSOLUTEQUERY_REPO", REPO_URL)
     branch = os.environ.get("ABSOLUTEQUERY_BRANCH", BRANCH)
+    out: dict = {}
+
+    def run():
+        try:
+            out["sha"] = latest_sha(repo, branch)
+        except Exception as e:  # noqa: BLE001 - reported by update()
+            out["error"] = e
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+    def result() -> str:
+        t.join()
+        if "error" in out:
+            raise out["error"]
+        return out["sha"]
+
+    return result
+
+
+def update(state: dict, latest) -> None:
+    repo = os.environ.get("ABSOLUTEQUERY_REPO", REPO_URL)
     try:
-        sha = latest_sha(repo, branch)
+        sha = latest()
         if sha == state.get("sha") and Path(state.get("dir", "")).is_dir():
             return
         d = download(repo, sha)
@@ -240,8 +266,9 @@ def show_error(text: str) -> None:
 def main() -> None:
     VERSIONS.mkdir(exist_ok=True)
     state = read_state()
+    latest = check_code()  # both checks at once: one network wait, not two
     update_program(state)
-    update(state)
+    update(state, latest)
     tries = [(Path(d).name, d) for d in (state.get("dir"), state.get("previous")) if d]
     for label, folder in tries + [("bundled", str(bundled()))]:
         if not folder or not (Path(folder) / f"{ENTRY}.py").is_file():

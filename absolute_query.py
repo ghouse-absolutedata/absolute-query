@@ -10,11 +10,19 @@ Optional defaults for the first connection: DB_SERVER / DB_UID / DB_PWD from env
 a .env file next to the app (or in a parent folder). Otherwise add one in the app.
 
 Reads
-  Load     table + optional Where + Top
-  SQL      any single SELECT / WITH query (read-only, rolled back, Top caps rows).
-           Result columns named like columns of the selected table are editable;
-           joined / expression columns are shown read-only and never written.
+  Load     table + optional Where + Top. Paste a spreadsheet column (header, then
+           one value per line) into Where to get `Header IN (v1, v2, ...)`.
+  SQL      any single SELECT / WITH query, Top caps rows. No database or table
+           needs picking first: SQL Server reports where each result column comes
+           from, and the result edits that table (three-part names switch the
+           database). With joins it edits the picked table if it is in the
+           result, else the first table whose key columns are all selected.
+           Other tables' and expression columns are read-only, never written.
            Updates need the table key in the result.
+
+  Every read runs READ UNCOMMITTED (the same as WITH (NOLOCK) on every table)
+  in its own transaction, which is committed. Rows stream in chunks: the status
+  bar shows rows read and time, and Cancel stops a long query.
 
 Writes
   Insert   rows with no DB origin (pasted / typed / imported)
@@ -29,6 +37,28 @@ Audit columns (matched case-insensitively, only when present on the table)
   insert   CreatedDate = GETDATE(), CreatedBy = OS login user
   update   ModifiedDate = GETDATE(), ModifiedBy = OS login user
 
+Types, keys and lookups
+  Typed values must fit the column type (number, date as YYYY-MM-DD, length,
+  decimal digits, bit 0/1, GUID); a wrong one is refused. Pasted values are
+  kept but marked red with the reason, and Insert / Update stay disabled until
+  they are fixed. Hover a header for type, key and lookup details. Key columns
+  have accent-coloured headers, lookup columns blue ones with a dropdown.
+  Lookup values come from a lookup file (Settings) or else from a foreign key's
+  referenced column (when it has at most 5000 values). A foreign key dropdown
+  shows a text column of the referenced table beside the key ("3  ·  ISIN"),
+  the cell keeps the key. The column is picked automatically (*Name, then
+  *Description, then *Code); right-click the header -> Lookup label… to pick
+  another, show the key only, or turn the dropdown off (remembered per
+  referenced table; Settings forgets). Typing a label (or part of it) finds
+  the entry; Enter stores its key ("valoren" -> 6), in the cell or the fx bar. Lookup file, JSON (a two-column SELECT
+  shows its second column the same way):
+      {"Sales.dbo.Orders.Status": ["Open", "Shipped", "Closed"],
+       "dbo.Orders.Currency": {"sql": "SELECT Code FROM dbo.Currency", "database": "Ref"},
+       "CountryCode": {"sql": "SELECT Code FROM dbo.Country"}}
+  Keys: database.schema.table.column, schema.table.column, table.column or
+  column (any table); the most specific wins. A column with a lookup accepts
+  only those values (or blank = NULL).
+
 Dry run
   Runs the same statements inside a transaction and rolls back, so type
   conversions, constraints and triggers are validated, then writes a CSV of
@@ -38,6 +68,7 @@ Settings (gear icon in the title bar, saved to ~/.absolutequery.json)
   Review before push   Update shows every changed cell as old -> new, Insert shows
                        the new rows; nothing is sent until confirmed
   Theme                Light / Dark
+  Lookup file          allowed values per column, see Types, keys and lookups
 
 Spreadsheet
   Name box + fx bar edit the selected cell; status bar shows Count / Sum / Average.
@@ -63,6 +94,7 @@ import bisect
 import copy
 import csv
 import datetime as dt
+import functools
 import getpass
 import json
 import os
@@ -76,17 +108,21 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
 import pyodbc
-from tksheet import Sheet
+from tksheet import Sheet, num2alpha
+from tksheet import column_headers as _tks_ch, main_table as _tks_mt, row_index as _tks_ri
 
 import connections as conns
 import excel_ops
+from icons import ICONS
 
 APP_DIR = Path(__file__).resolve().parent
 # the installed launcher runs the app from a cache folder; keep user files in its data folder
 DRY_RUN_DIR = Path(os.environ.get("ABSOLUTEQUERY_DATA") or APP_DIR) / "dry_run"
 VERSION = os.environ.get("ABSOLUTEQUERY_VERSION", "dev")
 BATCH = 2000
+SPARE_ROWS = 50  # empty rows kept under the data for new records
 LOCK_TIMEOUT_MS = 15000
+MAX_CHOICES = 5000  # a lookup with more values gets no dropdown (the server still checks keys)
 
 CREATED_DATE = {"createddate", "created_date", "createdon", "created_on", "createdat", "created_at"}
 CREATED_BY = {"createdby", "created_by"}
@@ -98,18 +134,18 @@ MODIFIED_BY = {"modifiedby", "modified_by", "updatedby", "updated_by"}
 LIGHT = {
     "bg": "#f3f3f3", "surface": "#ffffff", "line": "#d4d4d4", "grid": "#e1e1e1", "field": "#c6c6c6",
     "text": "#1f1f1f", "text2": "#444444", "muted": "#7a7a7a", "disabled": "#a6a6a6",
-    "band": "#217346", "band_text": "#d5e8dc", "button": "#217346", "button_hover": "#185c37",
+    "button": "#217346", "button_hover": "#185c37",
     "accent": "#217346", "accent_soft": "#e3efe8", "hover": "#e1e1e1", "header": "#f3f3f3",
     "header_sel": "#d2d2d2", "edited": "#fff2cc", "new": "#e2efda", "old": "#fbe2e0",
-    "readonly": "#f2f2f2", "error": "#c42b1c",
+    "readonly": "#f2f2f2", "error": "#c42b1c", "link": "#1f5fa8",
 }
 DARK = {
     "bg": "#202020", "surface": "#2b2b2b", "line": "#404040", "grid": "#3a3a3a", "field": "#555555",
     "text": "#e8e8e8", "text2": "#c4c4c4", "muted": "#9a9a9a", "disabled": "#6e6e6e",
-    "band": "#185c37", "band_text": "#bcd9c7", "button": "#107c41", "button_hover": "#0c6534",
+    "button": "#107c41", "button_hover": "#0c6534",
     "accent": "#5cb88a", "accent_soft": "#2f4337", "hover": "#3a3a3a", "header": "#252525",
     "header_sel": "#3c3c3c", "edited": "#4a4020", "new": "#24402d", "old": "#4a2626",
-    "readonly": "#333333", "error": "#ff7b6e",
+    "readonly": "#333333", "error": "#ff7b6e", "link": "#7fb2ea",
 }
 C = dict(LIGHT)
 if os.name == "nt":
@@ -121,7 +157,7 @@ SETTINGS_FILE = Path.home() / ".absolutequery.json"
 
 
 def load_settings() -> dict:
-    s = {"theme": "Light", "review": True}
+    s = {"theme": "Light", "review": True, "lookup_file": "", "ime": False}
     try:
         s.update(json.loads(SETTINGS_FILE.read_text()))
     except (OSError, ValueError):
@@ -211,8 +247,21 @@ def fmt(v) -> str:
 
 
 class Col:
-    def __init__(self, name, type_, is_identity, is_computed, is_pk, external=False):
+    def __init__(self, name, type_, is_identity, is_computed, is_pk, external=False,
+                 max_length=0, precision=0, scale=0):
         self.name, self.type = name, type_
+        # characters for (n)(var)char (-1 = max), digits for decimal / numeric
+        self.size = max_length // 2 if type_ in ("nchar", "nvarchar") and max_length > 0 else max_length
+        self.precision, self.scale = precision, scale
+        self.fk = ""  # "schema.table.column" this column references, if a single-column foreign key
+        self.lookup = ""  # where the allowed values come from (foreign key or lookup file)
+        self.choices: frozenset[str] | None = None  # allowed values; None = anything of the type
+        self.choice_list: list[str] = []  # dropdown entries: "key" or "key  ·  label"
+        self.picked: dict[str, str] = {}  # dropdown entry -> key, for entries with a label
+        self.key_label: dict[str, str] = {}
+        self.ref_name = ""  # "database.schema.table" the foreign key points at
+        self.label_options: list[str] = []  # its text columns, to show beside the key
+        self.label_col = ""  # the one shown
         self.label = name  # grid header; a query alias when it differs from the column name
         self.external = external  # query column not in the target table: shown, never written
         self.readonly = bool(external or is_identity or is_computed
@@ -233,6 +282,9 @@ class Db:
     def __init__(self):
         self.cn: pyodbc.Connection | None = None
         self.args = None
+        self.active: pyodbc.Cursor | None = None  # running statement, for cancel()
+        self.fetched = 0  # rows read so far by the running statement, for progress
+        self.cancelled = False
 
     def connect(self, server, uid, pwd):
         self.close()
@@ -254,20 +306,65 @@ class Db:
                 pass
             self.cn = None
 
-    def cur(self, database: str) -> pyodbc.Cursor:
+    def cur(self, database: str, write: bool = False) -> pyodbc.Cursor:
+        """Cursor in `database`. Reads run READ UNCOMMITTED - the same as NOLOCK on
+        every table - so they never wait on or block other sessions; writes run
+        READ COMMITTED."""
         if self.cn is None:
             raise RuntimeError("Not connected")
+        setup = ((f"USE {q(database)}; " if database else "") + "SET TRANSACTION ISOLATION LEVEL "
+                 f"{'READ COMMITTED' if write else 'READ UNCOMMITTED'};")
         try:
             c = self.cn.cursor()
-            c.execute(f"USE {q(database)}")
+            c.execute(setup)
             return c
         except pyodbc.Error as e:
             if "08S01" in str(e) or "08003" in str(e):  # dropped link: reconnect once
                 self.connect(*self.args)
                 c = self.cn.cursor()
-                c.execute(f"USE {q(database)}")
+                c.execute(setup)
                 return c
             raise
+
+    def _read(self, database, sql, params=(), top=None) -> tuple[list[str], list[list[str]]]:
+        """One read in its own transaction, committed. Rows arrive in chunks so
+        self.fetched shows progress and cancel() can stop it between chunks."""
+        c = self.cur(database)
+        self.active, self.fetched, self.cancelled = c, 0, False
+        try:
+            c.execute(sql, *params)
+            while c.description is None and c.nextset():
+                pass
+            if c.description is None:
+                raise RuntimeError("Query returned no result set")
+            names = [d[0] or f"col{i + 1}" for i, d in enumerate(c.description)]
+            rows: list[list[str]] = []
+            while top is None or len(rows) < top:
+                chunk = c.fetchmany(5000 if top is None else min(5000, top - len(rows)))
+                if not chunk:
+                    break
+                rows += [[v if type(v) is str else fmt(v) for v in r] for r in chunk]  # most cells are text
+                self.fetched = len(rows)
+            c.close()
+            self.cn.commit()
+            return names, rows
+        except Exception:
+            self.cn.rollback()
+            if self.cancelled:  # the driver reports a cancel in several ways
+                raise RuntimeError("Cancelled") from None
+            raise
+        finally:
+            self.active = None
+
+    def cancel(self):
+        """Stop the running statement (called from the UI thread)."""
+        c = self.active
+        if c is not None:
+            self.cancelled = True
+            try:
+                c.cancel()
+            except pyodbc.Error:
+                pass
 
     def databases(self) -> list[str]:
         c = self.cur("master")
@@ -290,7 +387,8 @@ class Db:
         c = self.cur(database)
         rows = c.execute("""
             SELECT c.name, ty.name, c.is_identity, c.is_computed,
-                   CASE WHEN pk.column_id IS NULL THEN 0 ELSE 1 END
+                   CASE WHEN pk.column_id IS NULL THEN 0 ELSE 1 END,
+                   c.max_length, c.precision, c.scale
             FROM sys.columns c
             JOIN sys.types ty ON ty.user_type_id = c.user_type_id
             LEFT JOIN (SELECT ic.object_id, ic.column_id
@@ -309,11 +407,66 @@ class Db:
                                     WHERE object_id = OBJECT_ID(?) AND is_unique = 1)""",
                 f"{q(schema)}.{q(name)}", f"{q(schema)}.{q(name)}").fetchall()
             uqs = {r[0] for r in uq}
-            rows = [(r[0], r[1], r[2], r[3], r[0] in uqs) for r in rows]
+            rows = [(r[0], r[1], r[2], r[3], r[0] in uqs, *r[5:]) for r in rows]
         self.cn.commit()
         if not rows:
             raise RuntimeError(f"Table {database}.{schema}.{name} not found")
-        return [Col(*r) for r in rows]
+        cols = [Col(*r[:5], max_length=r[5], precision=r[6], scale=r[7]) for r in rows]
+        fks = c.execute("""
+            SELECT COL_NAME(k.parent_object_id, k.parent_column_id),
+                   OBJECT_SCHEMA_NAME(k.referenced_object_id) + '.' + OBJECT_NAME(k.referenced_object_id)
+                   + '.' + COL_NAME(k.referenced_object_id, k.referenced_column_id)
+            FROM sys.foreign_key_columns k
+            WHERE k.parent_object_id = OBJECT_ID(?)
+              AND NOT EXISTS (SELECT 1 FROM sys.foreign_key_columns o  -- single-column keys only
+                              WHERE o.constraint_object_id = k.constraint_object_id
+                                AND o.constraint_column_id > 1)""", f"{q(schema)}.{q(name)}").fetchall()
+        self.cn.commit()
+        by_name = {col.name: col for col in cols}
+        for col_name, ref in fks:
+            if col_name in by_name:
+                by_name[col_name].fk = ref
+        return cols
+
+    def lookups(self, database: str, table: str, cols: list[Col], spec: dict, labels: dict) -> None:
+        """Fill col.choices from the lookup file (`spec`, see lookup_for) or, failing
+        that, from the referenced column of a foreign key. A foreign key's dropdown
+        shows a text column of the referenced table beside the key: the one chosen
+        from the header menu (`labels`, "db.schema.table" -> column, "" = key only,
+        NO_LOOKUP = no dropdown), else the likeliest (see guess_label)."""
+        jobs = []
+        for col in cols:
+            if col.external or col.readonly:
+                continue
+            entry = lookup_for(spec, database, table, col.name)
+            if isinstance(entry, list):
+                set_choices(col, [str(v) for v in entry], "lookup file")
+            elif isinstance(entry, dict) and entry.get("sql"):
+                jobs.append((col, entry.get("database") or database, entry["sql"], "lookup file"))
+            elif col.fk:
+                ref_schema, ref_table, ref_col = col.fk.split(".")
+                rows = self._read(database, "SELECT SUM(rows) FROM sys.partitions WHERE object_id = OBJECT_ID(?) "
+                                            "AND index_id IN (0, 1)", (f"{q(ref_schema)}.{q(ref_table)}",))[1]
+                if rows and rows[0][0] and int(rows[0][0]) > MAX_CHOICES:  # too big to list
+                    continue
+                col.ref_name = f"{database}.{ref_schema}.{ref_table}"
+                label = labels.get(col.ref_name)
+                col.label_options = [r[0] for r in self._read(database, """
+                    SELECT c.name FROM sys.columns c
+                    JOIN sys.types t ON t.user_type_id = c.user_type_id
+                    WHERE c.object_id = OBJECT_ID(?) AND c.name <> ?
+                      AND t.name IN ('char', 'varchar', 'nchar', 'nvarchar')
+                    ORDER BY c.column_id""", (f"{q(ref_schema)}.{q(ref_table)}", ref_col))[1]]
+                if label == NO_LOOKUP:  # turned off from the header menu
+                    continue
+                col.label_col = guess_label(col.label_options) if label is None else label
+                label = col.label_col
+                jobs.append((col, database, fk_lookup_sql(col.fk, label), f"foreign key to {col.fk}"))
+        for col, db, sql, source in jobs:
+            err = check_select(sql)
+            if err:
+                raise RuntimeError(f"Lookup for {col.name}: {err}")
+            set_choices(col, self._read(db, sql, top=MAX_CHOICES + 1)[1], source)
 
     def load(self, database, table, cols: list[Col], where: str, top: int):
         schema, name = split_table(table)
@@ -324,15 +477,12 @@ class Db:
         keys = [q(c.name) for c in cols if c.is_pk]
         if keys:
             sql += " ORDER BY " + ", ".join(keys)
-        c = self.cur(database)
-        rows = [[fmt(v) for v in r] for r in c.execute(sql).fetchall()]
-        self.cn.commit()
-        return rows
+        return self._read(database, sql, top=top)[1]
 
     def sources(self, database, sql: str) -> list[tuple] | None:
-        """Real origin of each result column: (schema, table, column) or None for
-        expressions. Uses SQL Server's own metadata, so aliases and joins resolve
-        exactly. None when the server cannot describe the query."""
+        """Real origin of each result column: (database, schema, table, column) or
+        None for expressions. Uses SQL Server's own metadata, so aliases, joins and
+        three-part names resolve exactly. None when the server cannot describe it."""
         c = self.cur(database)
         try:
             rows = c.execute(
@@ -343,34 +493,24 @@ class Db:
             rows = None
         finally:
             c.close()
-            self.cn.rollback()
+            self.cn.commit()
         if not rows:
             return None
-        return [(r[1], r[2], r[3]) if r[2] and r[3] and (r[0] is None or r[0].lower() == database.lower())
-                else None for r in rows]
+        if not database:
+            database = self.cn.execute("SELECT DB_NAME()").fetchval()
+            self.cn.commit()
+        return [(r[0] or database, r[1] or "dbo", r[2], r[3]) if r[2] and r[3] else None for r in rows]
 
     def query(self, database, sql: str, top: int) -> tuple[list[str], list[list[str]]]:
-        """Run a user SELECT read-only (always rolled back), first `top` rows."""
-        c = self.cur(database)
-        try:
-            c.execute(sql)
-            while c.description is None and c.nextset():
-                pass
-            if c.description is None:
-                raise RuntimeError("Query returned no result set")
-            names = [d[0] or f"col{i + 1}" for i, d in enumerate(c.description)]
-            rows = [[fmt(v) for v in r] for r in c.fetchmany(top)]
-        finally:
-            c.close()
-            self.cn.rollback()
-        return names, rows
+        """Run a user SELECT (checked read-only by check_select), first `top` rows."""
+        return self._read(database, sql, top=top)
 
     # writes ---------------------------------------------------------------
     def write(self, database, steps, user: str, dry_run=False) -> int:
         """Run every step in ONE transaction, commit at the end (rollback on dry run).
         step = (sql, payloads, expect_exact); sql takes params (user, json batch),
         payloads = [(grid_row, json_obj)]. Returns affected rows."""
-        c = self.cur(database)
+        c = self.cur(database, write=True)
         total = 0
         try:
             for sql, payloads, exact in steps:
@@ -400,7 +540,7 @@ class Db:
 
     def _locate(self, database, sql, chunk, user, err) -> RowError:
         """Replay a failed batch row by row inside a rolled-back txn to find the bad row."""
-        c = self.cur(database)
+        c = self.cur(database, write=True)
         try:
             for grid_row, p in chunk:
                 try:
@@ -414,6 +554,8 @@ class Db:
 
 def clean_err(e: Exception) -> str:
     s = str(e.args[1] if isinstance(e, pyodbc.Error) and len(e.args) > 1 else e)
+    if "HY008" in s or "Operation canceled" in s:
+        return "Cancelled"
     s = re.sub(r"^\[\w+\]\s*", "", s)
     s = re.sub(r"\[Microsoft\]\[ODBC Driver \d+ for SQL Server\]\[SQL Server\]", "", s)
     return re.sub(r"\s*\(\d+\)\s*\(SQL\w+\)\s*$", "", s).strip()
@@ -500,6 +642,235 @@ WRITE_WORDS = re.compile(
     r"deny|backup|restore|dbcc|shutdown|kill|bulk|openrowset|opendatasource|sp_\w+|xp_\w+)\b", re.I)
 
 
+INT_RANGE = {"tinyint": (0, 255), "smallint": (-2 ** 15, 2 ** 15 - 1), "int": (-2 ** 31, 2 ** 31 - 1),
+             "bigint": (-2 ** 63, 2 ** 63 - 1)}
+TEXT_TYPES = {"char", "varchar", "nchar", "nvarchar"}
+DATETIME_TYPES = {"datetime", "datetime2", "smalldatetime", "datetimeoffset"}
+
+
+def cell_error(col: "Col", v: str) -> str | None:
+    """Why `v` cannot go into `col`, or None when it can. Blank / NULL always can."""
+    if col.external or col.readonly or col.audit:
+        return None
+    if col.choices is not None and v not in col.choices and v != "" and v.strip().upper() != "NULL":
+        return f"Not in the lookup list ({col.lookup})"
+    return _value_error(col.type, col.size, col.precision, col.scale, v)
+
+
+def col_info(col: "Col") -> str:
+    """'ISIN · varchar(12) · primary key · lookup: foreign key to dbo.Bond.ISIN'"""
+    if col.external:
+        return f"{col.label} · not from the target table, read-only"
+    t = col.type
+    if t in TEXT_TYPES:
+        t += f"({'max' if col.size == -1 else col.size})"
+    elif t in ("decimal", "numeric"):
+        t += f"({col.precision},{col.scale})"
+    parts = [col.name, t]
+    if col.is_pk:
+        parts.append("primary key")
+    if col.readonly:
+        parts.append("read-only")
+    elif col.audit:
+        parts.append("set automatically")
+    if col.choices is not None:
+        parts.append(f"{len(col.choices):,} allowed values from {col.lookup}")
+    elif col.fk:
+        parts.append(f"foreign key to {col.fk}")
+    return "  ·  ".join(parts)
+
+
+def load_lookup_file(path: str) -> dict:
+    """Lookup file: JSON object, key = column, value = the allowed values or a query.
+
+        {"Sales.dbo.Orders.Status": ["Open", "Shipped", "Closed"],
+         "dbo.Orders.Currency": {"sql": "SELECT Code FROM dbo.Currency", "database": "Ref"},
+         "CountryCode": {"sql": "SELECT Code FROM dbo.Country"}}
+
+    A key names a column as database.schema.table.column, schema.table.column,
+    table.column or just column (any table); the most specific key wins."""
+    if not path:
+        return {}
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Lookup file must be a JSON object")
+    return {k.lower().replace("[", "").replace("]", ""): v for k, v in data.items()}
+
+
+def lookup_for(spec: dict, database: str, table: str, column: str):
+    schema, name = split_table(table)
+    for key in (f"{database}.{schema}.{name}.{column}", f"{schema}.{name}.{column}", f"{name}.{column}",
+                column):
+        if key.lower() in spec:
+            return spec[key.lower()]
+    return None
+
+
+NO_LOOKUP = "-"  # saved label choice: no dropdown for this foreign key
+
+
+def guess_label(names: list[str]) -> str:
+    """The text column that most likely names a lookup row: *Name, then
+    *Description, then *Code, then the first; audit columns never."""
+    names = [n for n in names if not re.search(r"(created|modified|updated)(by|user)$", n, re.I)]
+    for pat in (r"name$", r"desc(ription)?$", r"code$"):
+        hit = [n for n in names if re.search(pat, n, re.I)]
+        if hit:
+            return hit[0]
+    return names[0] if names else ""
+
+
+def choice_search(search_for: str, data) -> int | None:
+    """Dropdown search: which entry ("key" or "key  ·  label") the typed text
+    means. Exact key, exact label, key or label starting with it, label
+    containing it - in that order, ignoring case. No fuzzy guesses."""
+    t = search_for.strip().lower()
+    if not t:
+        return None
+    split = [(i, *(str(e).lower().split("  ·  ", 1) + [""])[:2]) for i, e in enumerate(data) if str(e)]
+    for test in (lambda k, lb: k == t, lambda k, lb: lb == t, lambda k, lb: k.startswith(t),
+                 lambda k, lb: lb.startswith(t), lambda k, lb: t in lb):
+        for i, k, lb in split:
+            if test(k, lb):
+                return i
+    return None
+
+
+def resolve_choice(col: "Col", v: str) -> str:
+    """Typed text in a lookup column -> the key it means (unchanged if none)."""
+    if col.choices is None or v in col.choices or v == "" or v.strip().upper() == "NULL":
+        return v
+    i = choice_search(v, col.choice_list)
+    if i is None:
+        return v
+    entry = col.choice_list[i]
+    return col.picked.get(entry, entry)
+
+
+def fk_lookup_sql(fk: str, label: str = "") -> str:
+    """Values of the column a foreign key references, with `label` beside them."""
+    ref_schema, ref_table, ref_col = fk.split(".")
+    shown = f", MIN({q(label)})" if label else ""
+    return (f"SELECT TOP ({MAX_CHOICES + 1}) {q(ref_col)}{shown} FROM {q(ref_schema)}.{q(ref_table)} "
+            f"WHERE {q(ref_col)} IS NOT NULL GROUP BY {q(ref_col)} ORDER BY 1")
+
+
+def set_choices(col: "Col", rows: list, source: str) -> None:
+    """rows: values, or [value, label] pairs (a second column is shown beside the value)."""
+    rows = [r if isinstance(r, (list, tuple)) else [r] for r in rows]
+    rows = list({str(r[0]): r for r in rows if r and str(r[0]) != ""}.values())
+    if len(rows) > MAX_CHOICES:  # too many to list: leave it to the server
+        return
+    col.choices, col.lookup = frozenset(str(r[0]) for r in rows), source
+    col.choice_list, col.picked, col.key_label = [], {}, {}
+    for r in rows:
+        key, label = str(r[0]), str(r[1]) if len(r) > 1 and r[1] not in (None, "") else ""
+        entry = f"{key}  ·  {label}" if label else key
+        col.choice_list.append(entry)
+        if label:
+            col.picked[entry], col.key_label[key] = key, label
+
+
+@functools.lru_cache(maxsize=65536)
+def _value_error(t: str, size: int, precision: int, scale: int, v: str) -> str | None:
+    if v == "" or v.strip().upper() == "NULL":
+        return None
+    if t in INT_RANGE:
+        if not re.fullmatch(r"-?\d+", v):
+            return "Whole number expected"
+        lo, hi = INT_RANGE[t]
+        return None if lo <= int(v) <= hi else f"Out of range for {t}"
+    if t in ("decimal", "numeric"):
+        m = re.fullmatch(r"-?(\d*)(?:\.(\d*))?", v)
+        if not m or not (m.group(1) or m.group(2)):
+            return "Number expected"
+        whole, frac = m.group(1).lstrip("0"), (m.group(2) or "").rstrip("0")
+        if len(whole) > precision - scale or len(frac) > scale:
+            return f"Too many digits for {t}({precision},{scale})"
+        return None
+    if t in ("float", "real", "money", "smallmoney"):
+        try:
+            float(v)
+            return None
+        except ValueError:
+            return "Number expected"
+    if t == "bit":
+        return None if v.lower() in ("0", "1", "true", "false") else "Use 0 or 1"
+    if t == "date":
+        try:
+            dt.date.fromisoformat(v)
+            return None
+        except ValueError:
+            return "Date as YYYY-MM-DD expected"
+    if t in DATETIME_TYPES:
+        try:
+            dt.datetime.fromisoformat(v)
+            return None
+        except ValueError:
+            return "Date and time as YYYY-MM-DD hh:mm:ss expected"
+    if t == "time":
+        try:
+            dt.time.fromisoformat(v)
+            return None
+        except ValueError:
+            return "Time as hh:mm:ss expected"
+    if t == "uniqueidentifier":
+        return None if re.fullmatch(r"\{?[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\}?", v) \
+            else "GUID expected"
+    if t in TEXT_TYPES and size > 0 and len(v) > size:
+        return f"Longer than {size} characters"
+    return None
+
+
+NUMERIC = {"tinyint", "smallint", "int", "bigint", "decimal", "numeric", "float", "real", "money",
+           "smallmoney", "bit"}
+
+
+def in_clause(text: str, cols: dict[str, "Col"]) -> str | None:
+    """'Col\nv1\nv2' (first spreadsheet column) -> "[Col] IN ('v1', 'v2')".
+    None when the text is not a header plus values. Numbers stay unquoted for
+    numeric columns; repeats are dropped."""
+    lines = [ln.split("\t")[0].strip() for ln in text.replace("\r", "").split("\n")]
+    lines = [ln for ln in lines if ln]
+    if len(lines) < 2:
+        return None
+    head = lines[0].strip("[]")
+    col = cols.get(head.lower())
+    if col is None and not re.fullmatch(r"[A-Za-z_]\w{0,127}", head):  # unknown names: plain words only
+        return None
+    name = col.name if col else head
+    values = list(dict.fromkeys(lines[1:]))
+    numeric = col is not None and col.type in NUMERIC and all(
+        re.fullmatch(r"-?\d+(\.\d+)?", v) for v in values)
+    vals = values if numeric else ["'" + v.replace("'", "''") + "'" for v in values]
+    return f"{q(name)} IN ({', '.join(vals)})"
+
+
+def edit_target(db: "Db", database: str, table: str, srcs) -> tuple[str, str, list["Col"]]:
+    """Which table a query result edits: (database, schema.table, its columns), or
+    ("", "", []) for a read-only result. The table picked in the toolbar when the
+    result has its columns, else the first table (in column order) whose key
+    columns are all in the result, else the first table that resolves."""
+    found = list(dict.fromkeys(s[:3] for s in srcs or [] if s))
+    if not found:
+        return "", "", []
+    picked = [f for f in found if f[0].lower() == database.lower()
+              and (f[1].lower(), f[2].lower()) == tuple(x.lower() for x in split_table(table))] if table else []
+    first = None
+    for tdb, schema, name in picked or found:
+        try:
+            cols = db.columns(tdb, f"{schema}.{name}")
+        except Exception:  # noqa: BLE001 - e.g. a system view: not editable
+            continue
+        if first is None:
+            first = (tdb, f"{schema}.{name}", cols)
+        shown = {s[3].lower() for s in srcs if s and s[:3] == (tdb, schema, name)}
+        keys = [c.name.lower() for c in cols if c.is_pk]
+        if picked or (keys and all(k in shown for k in keys)):
+            return tdb, f"{schema}.{name}", cols
+    return first or ("", "", [])
+
+
 def table_refs(sql: str, table: str) -> int:
     """How many times `table` is named after FROM / JOIN / a comma in a FROM list."""
     bare = re.sub(r"--[^\n]*|/\*.*?\*/", " ", sql, flags=re.S)
@@ -561,6 +932,8 @@ class Tab:
         self.ui = {"db": "", "table": "", "where": "", "top": "1000", "sql": "", "dry": False}
         self.sql_open = False
         self.note = ("Ready", False)
+        self.job: tuple | None = None  # (label, started, cancellable) while a job runs
+        self.bad: dict[tuple[int, int], str] = {}  # (data row, column) -> why the value is invalid
         self.label: tk.Label | None = None  # its tab in the tab strip
 
     @property
@@ -569,7 +942,7 @@ class Tab:
 
 
 TAB_STATE = ("db", "cols", "keys", "database", "table", "orig", "table_cols", "from_query",
-             "_all_tables", "filters", "_drag", "_near_handle", "_busy", "sheet", "conn_text")
+             "_all_tables", "filters", "_drag", "_near_handle", "_busy", "sheet", "conn_text", "bad")
 
 
 class App:
@@ -586,8 +959,13 @@ class App:
 
         root.title(APP_NAME)
         root.geometry("1440x860")
-        root.minsize(900, 520)
+        root.minsize(1100, 520)
         self.settings = load_settings()
+        if not self.settings["ime"]:
+            # X11 input methods (ibus, fcitx) cost an IM-server round trip per ttk
+            # widget, ~60 ms each under XWayland: seconds at start and on every tab
+            # switch. Off unless the IME setting is on (needed only for composed input).
+            root.tk.call("tk", "useinputmethods", 0)
         self._painted: list = []
         C.update(DARK if self.settings["theme"] == "Dark" else LIGHT)
         root.configure(bg=C["bg"])
@@ -611,30 +989,10 @@ class App:
         s.configure("Group.TLabel", background=C["surface"], foreground=C["muted"])
         s.configure("Status.TLabel", background=C["bg"], foreground=C["text2"])
         s.configure("Err.TLabel", background=C["bg"], foreground=C["error"])
-        for w in ("TEntry", "TCombobox", "TSpinbox"):
-            s.configure(w, fieldbackground=C["surface"], foreground=C["text"], padding=(4, 2),
-                        bordercolor=C["field"], lightcolor=C["surface"], darkcolor=C["surface"],
-                        arrowsize=11, arrowcolor=C["text2"], background=C["surface"])
-            s.map(w, bordercolor=[("focus", C["accent"])], lightcolor=[("focus", C["accent"])],
-                  fieldbackground=[("readonly", C["surface"])], foreground=[("readonly", C["text"])])
         self.root.option_add("*TCombobox*Listbox.background", C["surface"])
         self.root.option_add("*TCombobox*Listbox.foreground", C["text"])
         self.root.option_add("*TCombobox*Listbox.selectBackground", C["accent_soft"])
         self.root.option_add("*TCombobox*Listbox.selectForeground", C["text"])
-        # ribbon buttons: flat until hovered
-        s.configure("TButton", background=C["surface"], foreground=C["text"], padding=(8, 3), width=0,
-                    borderwidth=1, bordercolor=C["surface"], relief="flat")
-        s.map("TButton", background=[("disabled", C["surface"]), ("pressed", C["header_sel"]),
-                                     ("active", C["hover"])],
-              bordercolor=[("active", C["field"])], foreground=[("disabled", C["disabled"])])
-        s.configure("Big.TButton", padding=(10, 8))
-        s.configure("Primary.TButton", background=C["button"], foreground="#ffffff", padding=(10, 8),
-                    bordercolor=C["button"])
-        s.map("Primary.TButton",
-              background=[("disabled", C["bg"]), ("pressed", C["button_hover"]),
-                          ("active", C["button_hover"])],
-              bordercolor=[("disabled", C["line"]), ("active", C["button_hover"])],
-              foreground=[("disabled", C["disabled"])])
         s.configure("TCheckbutton", background=C["surface"], foreground=C["text"],
                     indicatorbackground=C["surface"], indicatorforeground=C["text"])
         s.map("TCheckbutton", background=[("active", C["surface"])],
@@ -645,9 +1003,82 @@ class App:
         s.configure("Horizontal.TScrollbar", background=C["bg"], troughcolor=C["surface"],
                     bordercolor=C["surface"], arrowcolor=C["text2"])
 
+        # Rounded buttons and fields: ttk cannot round corners, so each state is a small
+        # anti-aliased image stretched around the content (9-slice). Element names are
+        # per theme because ttk elements cannot be redefined.
+        self._gen = getattr(self, "_gen", 0) + 1
+        self._imgs: list[tk.PhotoImage] = []  # ttk only keeps image names
+
+        def box(fill, border):
+            img = rounded(24, 24, 6, C[fill], C[border], C["surface"])
+            self._imgs.append(img)
+            return img
+
+        def element(name, normal, *states):
+            full = f"aq{self._gen}.{name}"
+            s.element_create(full, "image", normal, *states, border=7, padding=0, sticky="nsew")
+            return full
+
+        ghost = element("ghost", box("surface", "surface"), ("disabled", box("surface", "surface")),
+                        ("pressed", box("header_sel", "header_sel")),
+                        ("selected", box("accent_soft", "accent")), ("active", box("hover", "hover")))
+        outline = element("outline", box("surface", "field"), ("disabled", box("surface", "line")),
+                          ("pressed", box("header_sel", "field")), ("active", box("hover", "field")))
+        primary = element("primary", box("button", "button"), ("disabled", box("bg", "line")),
+                          ("pressed", box("button_hover", "button_hover")),
+                          ("active", box("button_hover", "button_hover")))
+        field = element("field", box("surface", "field"), ("disabled", box("bg", "line")),
+                        ("focus", box("surface", "accent")))
+        arrow = f"aq{self._gen}.arrow"
+        s.element_create(arrow, "image", self.icon("chevron-down"),
+                         ("disabled", self.icon("chevron-down", "disabled")), sticky="", padding=(0, 0, 6, 0))
+
+        def button_layout(bg, part="Button"):
+            return [(bg, {"sticky": "nsew", "children": [
+                (f"{part}.padding", {"sticky": "nsew", "children": [
+                    (f"{part}.label", {"sticky": "nsew"})]})]})]
+
+        for style, bg, fg in (("TButton", outline, C["text"]), ("Tool.TButton", ghost, C["text"]),
+                              ("Primary.TButton", primary, "#ffffff")):
+            s.layout(style, button_layout(bg))
+            s.configure(style, padding=(10, 6), foreground=fg, background=C["surface"], anchor="center",
+                        width=0)
+            s.map(style, foreground=[("disabled", C["disabled"])])
+        for style, part in (("Toggle.TCheckbutton", "Toolbutton"), ("Tool.TMenubutton", "Menubutton")):
+            s.layout(style, button_layout(ghost, part))
+            s.configure(style, padding=(10, 6), foreground=C["text"], background=C["surface"], width=0)
+            s.map(style, foreground=[("disabled", C["disabled"])])
+
+        s.layout("TEntry", [(field, {"sticky": "nsew", "children": [
+            ("Entry.padding", {"sticky": "nsew", "children": [("Entry.textarea", {"sticky": "nsew"})]})]})])
+        s.layout("TCombobox", [(field, {"sticky": "nsew", "children": [
+            (arrow, {"side": "right", "sticky": ""}),
+            ("Combobox.padding", {"sticky": "nsew", "children": [
+                ("Combobox.textarea", {"sticky": "nsew"})]})]})])
+        for w in ("TEntry", "TCombobox"):
+            s.configure(w, padding=(8, 5), foreground=C["text"], fieldbackground=C["surface"],
+                        background=C["surface"])
+            s.map(w, foreground=[("disabled", C["disabled"]), ("readonly", C["text"])],
+                  fieldbackground=[("readonly", C["surface"])])
+
+    def icon(self, name: str, role: str = "text2") -> tk.PhotoImage:
+        """16px line icon in a palette color (text2, disabled) or "white"."""
+        color = "#ffffff" if role == "white" else C[role]
+        cache = self.__dict__.setdefault("_icons", {})
+        if (name, color) not in cache:
+            cache[name, color] = tk.PhotoImage(data=ICONS[name][color], format="png")
+        return cache[name, color]
+
+    def with_icon(self, widget, name: str, white=False):
+        """Give a ttk button an icon (and a disabled version); re-applied on theme change."""
+        self.__dict__.setdefault("_iconed", []).append((widget, name, white))
+        widget.configure(image=(self.icon(name, "white" if white else "text2"),
+                                "disabled", self.icon(name, "disabled")), compound="left")
+        return widget
+
     def paint(self, w, **opts):
         """Create-time colors for plain tk widgets; re-applied on theme change.
-        opts map a widget option to a palette key, e.g. bg="band"."""
+        opts map a widget option to a palette key, e.g. bg="surface"."""
         self._painted.append((w, opts))
         w.configure(**{k: C[v] for k, v in opts.items()})
         return w
@@ -658,6 +1089,9 @@ class App:
         self.v_set["theme"].set(self.settings["theme"])
         self.root.configure(bg=C["bg"])
         self._style()
+        for w, name, white in self._iconed:
+            w.configure(image=(self.icon(name, "white" if white else "text2"),
+                               "disabled", self.icon(name, "disabled")))
         for ib in (self.i_conn, self.i_settings):
             ib.redraw()
         for w, opts in self._painted:
@@ -677,92 +1111,81 @@ class App:
         if key == "theme":
             self.apply_theme()
 
-    def _group(self, ribbon, caption: str) -> ttk.Frame:
-        """Ribbon group: controls on top, caption underneath, hairline on the right."""
-        g = ttk.Frame(ribbon, padding=(10, 8, 10, 4))
-        g.pack(side="left", fill="y")
-        self.paint(tk.Frame(ribbon, width=1), bg="line").pack(side="left", fill="y", pady=8)
-        body = ttk.Frame(g)
-        body.pack(side="top", fill="both", expand=True)
-        ttk.Label(g, text=caption, style="Group.TLabel").pack(side="bottom", pady=(6, 0))
-        return body
-
     def _build(self):
         load_env()
-        lbl = dict(sticky="w", padx=(0, 6), pady=2)
-        fld = dict(sticky="we", padx=(0, 8), pady=2)
-
-        # title band
-        title = self.paint(tk.Frame(self.root, height=34), bg="band")
-        title.pack(fill="x")
-        self.paint(tk.Label(title, text=APP_NAME, font=(FONT[0], 10, "bold")),
-                   bg="band", fg="band_text").pack(side="left", padx=12, pady=6)
-        self.i_settings = IconButton(self, title, ICON_SETTINGS, lambda: SettingsDialog(self), "Settings")
-        self.i_settings.pack(side="right", padx=(0, 8))
-        self.i_conn = IconButton(self, title, ICON_SERVER, lambda: ConnDialog(self),
-                                 lambda: self.conn_text, dot=True)
-        self.i_conn.pack(side="right", padx=(0, 2))
-
-        # ribbon
-        ribbon = ttk.Frame(self.root)
-        ribbon.pack(fill="x")
-        self.paint(tk.Frame(self.root, height=1), bg="line").pack(fill="x")
-
         self.v_server, self.v_uid, self.v_pwd = tk.StringVar(), tk.StringVar(), tk.StringVar()
-
-        g = self._group(ribbon, "Source")
-        ttk.Label(g, text="Database").grid(row=0, column=0, **lbl)
-        self.v_db = tk.StringVar()
-        self.cb_db = ttk.Combobox(g, textvariable=self.v_db, width=16, state="readonly")
-        self.cb_db.grid(row=0, column=1, **fld)
-        self.cb_db.bind("<<ComboboxSelected>>", lambda e: self.pick_db())
-        ttk.Label(g, text="Table").grid(row=1, column=0, **lbl)
-        self.v_table = tk.StringVar()
-        self.cb_table = ttk.Combobox(g, textvariable=self.v_table, width=22)
-        self.cb_table.grid(row=1, column=1, **fld)
-        self.cb_table.bind("<KeyRelease>", self._filter_tables)
-        self.cb_table.bind("<Return>", lambda e: self.load())
-
-        g = self._group(ribbon, "Filter")
-        ttk.Label(g, text="Where").grid(row=0, column=0, **lbl)
-        self.v_where = tk.StringVar()
-        e_where = ttk.Entry(g, textvariable=self.v_where, width=20, font=MONO)
-        e_where.grid(row=0, column=1, columnspan=3, **fld)
-        e_where.bind("<Return>", lambda e: self.load())
-        ttk.Label(g, text="Top").grid(row=1, column=0, **lbl)
+        self.v_db, self.v_table, self.v_where = tk.StringVar(), tk.StringVar(), tk.StringVar()
         self.v_top = tk.StringVar(value="1000")
-        ttk.Spinbox(g, textvariable=self.v_top, from_=1, to=1_000_000, increment=1000,
-                    width=6).grid(row=1, column=1, **fld)
-        self.b_sql = ttk.Button(g, text="SQL query", command=self.toggle_sql)
-        self.b_sql.grid(row=1, column=2, columnspan=2, sticky="w", pady=2)
-        self.b_load = ttk.Button(g, text="Load", style="Big.TButton", command=self.load)
-        self.b_load.grid(row=0, column=4, rowspan=2, sticky="ns")
-
-        g = self._group(ribbon, "Rows")
-        self.b_blank = ttk.Button(g, text="Blank grid", command=self.blank)
-        self.b_blank.grid(row=0, column=0, sticky="we", pady=1)
-        self.b_paste = ttk.Button(g, text="Paste with headers", command=self.paste_with_headers)
-        self.b_paste.grid(row=1, column=0, sticky="we", pady=1)
-        self.b_import = ttk.Button(g, text="Import file", command=self.import_file)
-        self.b_import.grid(row=0, column=1, sticky="we", pady=1)
-        self.b_export = ttk.Button(g, text="Export CSV", command=self.export_csv)
-        self.b_export.grid(row=1, column=1, sticky="we", pady=1)
-
-        g = self._group(ribbon, "Push to database")
-        self.b_insert = ttk.Button(g, text="Insert rows", style="Primary.TButton",
-                                   command=self.insert, width=12)
-        self.b_insert.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 8))
-        self.b_update = ttk.Button(g, text="Update rows", style="Primary.TButton",
-                                   command=self.update, width=12)
-        self.b_update.grid(row=0, column=1, rowspan=2, sticky="ns", padx=(0, 8))
         self.v_dry = tk.BooleanVar(value=False)
-        ttk.Checkbutton(g, text="Dry run", variable=self.v_dry).grid(row=0, column=2, rowspan=2)
-
+        self.v_sql_open = tk.BooleanVar(value=False)
         self.v_set = {"review": tk.BooleanVar(value=self.settings["review"]),
                       "theme": tk.StringVar(value=self.settings["theme"])}
 
+        # one toolbar: source, filter, rows, push, then connection and settings
+        bar = ttk.Frame(self.root, padding=(12, 10))
+        bar.pack(fill="x")
+        self.paint(tk.Frame(self.root, height=1), bg="line").pack(fill="x")
+
+        def divider(side="left"):
+            self.paint(tk.Frame(bar, width=1, height=20), bg="line").pack(side=side, padx=12)
+
+        # right side first, so the Where field takes whatever width is left
+        self.i_settings = IconButton(self, bar, "settings", lambda: SettingsDialog(self), "Settings")
+        self.i_settings.pack(side="right")
+        self.i_conn = IconButton(self, bar, "server", lambda: ConnDialog(self),
+                                 lambda: self.conn_text, dot=True)
+        self.i_conn.pack(side="right", padx=(0, 4))
+        divider("right")
+        self.b_update = self.with_icon(ttk.Button(bar, text="Update", style="Primary.TButton",
+                                                  command=self.update), "pencil", white=True)
+        self.b_update.pack(side="right")
+        self.b_insert = self.with_icon(ttk.Button(bar, text="Insert", style="Primary.TButton",
+                                                  command=self.insert), "plus", white=True)
+        self.b_insert.pack(side="right", padx=(0, 8))
+        self.with_icon(ttk.Checkbutton(bar, text="Dry run", style="Toggle.TCheckbutton",
+                                       variable=self.v_dry), "flask-conical").pack(side="right", padx=(0, 8))
+
+        self.cb_db = ttk.Combobox(bar, textvariable=self.v_db, width=14, state="readonly")
+        self.cb_db.pack(side="left")
+        self.cb_db.bind("<<ComboboxSelected>>", lambda e: self.pick_db())
+        Hint(self, self.cb_db, self.v_db, "Database")
+        self.cb_table = ttk.Combobox(bar, textvariable=self.v_table, width=22)
+        self.cb_table.pack(side="left", padx=(8, 0))
+        self.cb_table.bind("<KeyRelease>", self._filter_tables)
+        self.cb_table.bind("<Return>", lambda e: self.load())
+        Hint(self, self.cb_table, self.v_table, "Table")
+        divider()
+        e_where = ttk.Entry(bar, textvariable=self.v_where, font=MONO)
+        e_where.pack(side="left", fill="x", expand=True)
+        e_where.bind("<Return>", lambda e: self.load())
+        e_where.bind("<<Paste>>", self._paste_where)
+        Hint(self, e_where, self.v_where, "Where")
+        ttk.Label(bar, text="Top", style="Group.TLabel").pack(side="left", padx=(12, 6))
+        digits = (self.root.register(lambda v: v.isdigit() or v == ""), "%P")
+        ttk.Entry(bar, textvariable=self.v_top, width=7, justify="right", validate="key",
+                  validatecommand=digits).pack(side="left")
+        self.b_load = self.with_icon(ttk.Button(bar, text="Load", style="Tool.TButton",
+                                                command=self.load), "play")
+        self.b_load.pack(side="left", padx=(8, 0))
+        self.b_sql = self.with_icon(ttk.Checkbutton(bar, text="SQL", style="Toggle.TCheckbutton",
+                                                    variable=self.v_sql_open, command=self.toggle_sql),
+                                    "code")
+        self.b_sql.pack(side="left", padx=(4, 0))
+        divider()
+        rows = self.with_icon(ttk.Menubutton(bar, text="Rows", style="Tool.TMenubutton"), "rows-3")
+        rows.pack(side="left")
+        menu = self.paint(tk.Menu(rows, tearoff=0, relief="flat", bd=1, font=FONT),
+                          bg="surface", fg="text", activebackground="hover", activeforeground="text",
+                          disabledforeground="disabled")
+        rows.configure(menu=menu)
+        self.b_blank = MenuItem(menu, "Blank grid", self.blank)
+        self.b_paste = MenuItem(menu, "Paste with headers", self.paste_with_headers)
+        menu.add_separator()
+        self.b_import = MenuItem(menu, "Import file…", self.import_file)
+        self.b_export = MenuItem(menu, "Export CSV…", self.export_csv)
+
         # free SQL panel, hidden until toggled
-        self.sql_box = ttk.Frame(self.root, style="Bar.TFrame", padding=(8, 6))
+        self.sql_box = ttk.Frame(self.root, padding=(12, 8))
         sql_wrap = self.paint(tk.Frame(self.sql_box, padx=1, pady=1), bg="line")
         sql_wrap.pack(side="left", fill="both", expand=True, padx=(0, 8))
         self.t_sql = self.paint(tk.Text(sql_wrap, height=5, font=MONO, wrap="none", undo=True,
@@ -771,21 +1194,19 @@ class App:
                                 selectbackground="accent_soft", selectforeground="text")
         self.t_sql.pack(fill="both", expand=True)
         self.t_sql.bind("<Control-Return>", lambda e: (self.run_query(), "break")[1])
-        side = ttk.Frame(self.sql_box, style="Bar.TFrame")
+        side = ttk.Frame(self.sql_box)
         side.pack(side="left", fill="y")
-        self.b_run = ttk.Button(side, text="Run query", style="Big.TButton", command=self.run_query)
+        self.b_run = self.with_icon(ttk.Button(side, text="Run", command=self.run_query), "play")
         self.b_run.pack(fill="x")
-        ttk.Label(side, text="Ctrl+Enter · read-only\nTable columns stay editable",
-                  style="Status.TLabel", justify="left").pack(anchor="w", pady=(6, 0))
+        ttk.Label(side, text="Ctrl+Enter", style="Group.TLabel").pack(anchor="w", pady=(6, 0))
 
         # name box + formula bar
-        fx = ttk.Frame(self.root, style="Bar.TFrame", padding=(8, 4))
+        fx = ttk.Frame(self.root, padding=(12, 6))
         fx.pack(fill="x")
         self.fx_bar = fx
         self.v_name = tk.StringVar()
         ttk.Entry(fx, textvariable=self.v_name, width=22, state="readonly").pack(side="left")
-        self.paint(tk.Label(fx, text="fx", font=(FONT[0], 10, "italic")),
-                   bg="bg", fg="muted").pack(side="left", padx=10)
+        self.paint(tk.Label(fx, text="fx", font=MONO), bg="surface", fg="muted").pack(side="left", padx=10)
         self.v_fx = tk.StringVar()
         self.e_fx = ttk.Entry(fx, textvariable=self.v_fx, font=CELL)
         self.e_fx.pack(side="left", fill="x", expand=True)
@@ -793,7 +1214,8 @@ class App:
         self.e_fx.bind("<FocusOut>", lambda e: self._fx_flush())
         self.e_fx.bind("<Escape>", lambda e: (self._fx_revert(), self.sheet.focus_set()))
 
-        self.grid_wrap = self.paint(tk.Frame(self.root, padx=0, pady=1), bg="line")
+        self.paint(tk.Frame(self.root, height=1), bg="line").pack(fill="x")
+        self.grid_wrap = self.paint(tk.Frame(self.root), bg="line")
         self.grid_wrap.pack(fill="both", expand=True)
 
         # sheet tab strip (tabs are drawn by _draw_tabs)
@@ -808,6 +1230,8 @@ class App:
         self.paint(tk.Frame(self.root, height=1), bg="line").pack(fill="x")
         foot = ttk.Frame(self.root, style="Bar.TFrame", padding=(12, 3))
         foot.pack(fill="x")
+        self.b_cancel = self.with_icon(ttk.Button(foot, text="Cancel", style="Tool.TButton",
+                                                  command=self.cancel_job), "x")
         self.l_stats = ttk.Label(foot, text="", style="Status.TLabel")
         self.l_stats.pack(side="right", padx=(16, 0))
         self.l_msg = ttk.Label(foot, text="Ready", style="Status.TLabel")
@@ -826,20 +1250,26 @@ class App:
         for seq, fn in tab_keys.items():
             self.root.bind_class("Text", seq, lambda e, fn=fn: (fn(), "break")[1])
         # Tk on Linux maps Ctrl+A to "start of line"; make it select all, as on Windows
-        for cls in ("Text", "TEntry", "TCombobox", "TSpinbox", "Entry"):
+        for cls in ("Text", "TEntry", "TCombobox", "Entry"):
             for seq in ("<Control-a>", "<Control-A>"):
                 self.root.bind_class(cls, seq, select_all)
             self.root.bind_class(cls, "<<Paste>>", paste_replace)
 
     def _new_sheet(self) -> Sheet:
         """Grid for the tab in self.tab (not packed; activate() shows it)."""
-        sheet = Sheet(
-            self.grid_wrap, data=[], headers=[], font=(CELL[0], CELL[1], "normal"),
-            header_font=(CELL[0], CELL[1], "normal"), index_font=(CELL[0], CELL[1], "normal"),
-            paste_can_expand_x=False, paste_can_expand_y=True, show_x_scrollbar=True,
-            default_row_height=22, default_column_width=110, default_row_index_width=48,
-            header_align="center", index_align="center", **sheet_colors(),
-        )
+        # tksheet flushes Tk's idle queue four times while building, which lays out
+        # the whole window each time; the next normal redraw does it once instead
+        idle, tk.Misc.update_idletasks = tk.Misc.update_idletasks, lambda w: None
+        try:
+            sheet = Sheet(
+                self.grid_wrap, data=[], headers=[], font=(CELL[0], CELL[1], "normal"),
+                header_font=(CELL[0], CELL[1], "normal"), index_font=(CELL[0], CELL[1], "normal"),
+                paste_can_expand_x=False, paste_can_expand_y=True, show_x_scrollbar=True,
+                default_row_height=22, default_column_width=110, default_row_index_width=48,
+                header_align="center", index_align="center", **sheet_colors(),
+            )
+        finally:
+            tk.Misc.update_idletasks = idle
         sheet.enable_bindings("all")
         # sort is offered as whole-row sort from the header menu; the per-cell sorts
         # would scramble rows, and columns come from the table so cannot be added
@@ -848,9 +1278,18 @@ class App:
         sheet.bind("<<SheetModified>>",
                    lambda e: (self._sync_columns(), self._schedule_marks(), self._on_select()))
         sheet.bind("<<SheetSelect>>", lambda e: (self._on_select(), self._place_handle()))
+        sheet.edit_validation(self._validate_edit)
+        sheet.MT.bind("<Motion>", self._hover_cell, add="+")
+        sheet.CH.bind("<Motion>", self._hover_header, add="+")
         self.sheet = sheet
         self._setup_excel()
+        self._scratch()
         return sheet
+
+    def _scratch(self):
+        """Empty sheet before a table is picked: lettered columns and blank cells."""
+        self.sheet.set_sheet_data([[""] * 26 for _ in range(100)], reset_col_positions=True)
+        self.sheet.headers([chr(65 + i) for i in range(26)])
 
     # sheet tabs ------------------------------------------------------------
     def new_tab(self, src: Tab | None = None) -> Tab:
@@ -884,6 +1323,7 @@ class App:
         self._show_sql(t.sql_open)
         text, error = t.note
         self.l_msg.configure(text=text, style="Err.TLabel" if error else "Status.TLabel")
+        self._progress()
         self._conn_icon()
         self._draw_tabs()
         self._refresh_buttons()
@@ -1050,6 +1490,7 @@ class App:
         self.i_conn.redraw()
 
     def _show_sql(self, on: bool):
+        self.v_sql_open.set(on)
         if on and not self.sql_box.winfo_manager():
             self.sql_box.pack(fill="x", before=self.grid_wrap)
         elif not on and self.sql_box.winfo_manager():
@@ -1067,9 +1508,16 @@ class App:
             return
         r, c = self._dr(cur.row), cur.column
         self.v_name.set(f"{self.cols[c].name}  {r + 1}")
+        self.l_stats.configure(text=col_info(self.cols[c]))
         v = self.sheet.get_cell_data(r, c) if r < self.sheet.get_total_rows() else ""
         self.v_fx.set("" if v is None else str(v))
         self._fx_cell = (self.tab, r, self.cols[c], self.v_fx.get())
+        if (r, c) in self.bad:
+            self.msg(f"{self.cols[c].name}: {self.bad[r, c]}", error=True)
+        elif self.cols[c].picked:  # a key with a label: say what it means
+            label = self.cols[c].key_label.get(self.v_fx.get())
+            if label:
+                self.msg(f"{self.cols[c].name} {self.v_fx.get()} = {label}")
         self.e_fx.state(["readonly"] if self.cols[c].readonly or self.cols[c].audit else ["!readonly"])
         self._sel_stats()
 
@@ -1108,12 +1556,51 @@ class App:
         new = self.v_fx.get()
         if new == shown or tab is not self.tab or col not in self.cols:
             return
-        self._fx_cell = (tab, r, col, new)
         if col.readonly or col.audit:
+            self._fx_cell = (tab, r, col, new)
             return self.msg(f"{col.name} is read-only", error=True)
+        new = resolve_choice(col, new)
+        if new != self.v_fx.get():
+            self.v_fx.set(new)
+            self.msg(f"{col.name} {new} = {col.key_label.get(new, new)}")
+        err = cell_error(col, new)
+        if err:
+            self.v_fx.set(shown)
+            return self.msg(f"{col.name}: {err}", error=True)
+        self._fx_cell = (tab, r, col, new)
         if r < self.sheet.get_total_rows():
             self.sheet.set_cell_data(r, self.cols.index(col), new, redraw=True)
             self._schedule_marks()
+
+    def _validate_edit(self, event):
+        """Typed cell edits must fit the column; pasted values are kept and marked
+        instead (see _marks), so a big paste never loses data."""
+        c = event.column
+        if event.eventname == "end_edit_table" and c < len(self.cols):
+            col = self.cols[c]
+            value = resolve_choice(col, "" if event.value is None else str(event.value))  # label -> key
+            err = cell_error(col, value)
+            if err:
+                self.msg(f"{self.cols[c].name}: {err}", error=True)
+                return None
+            if col.choices is not None:
+                if col.key_label.get(value):
+                    self.msg(f"{col.name} {value} = {col.key_label[value]}")
+                return value
+        return event.value
+
+    def _hover_cell(self, e):
+        if not self.bad:
+            return
+        r, c = self.sheet.identify_row(e, allow_end=False), self.sheet.identify_column(e, allow_end=False)
+        if r is not None and c is not None and (self._dr(r), c) in self.bad:
+            self.msg(f"{self.cols[c].name}: {self.bad[self._dr(r), c]}", error=True)
+
+    def _hover_header(self, e):
+        c = self.sheet.identify_column(e, allow_end=False)
+        if c is None or c >= len(self.cols):
+            return
+        self.l_stats.configure(text=col_info(self.cols[c]))
 
     def _fx_revert(self):
         if self._fx_cell:
@@ -1139,7 +1626,8 @@ class App:
                                ("Sort Z to A", lambda: self.sort(True), None),
                                ("Filter…", self.filter_dialog, "Ctrl+Shift+L"),
                                ("Clear filter", self.clear_filter, None),
-                               ("Autofit column", self.autofit, None)):
+                               ("Autofit column", self.autofit, None),
+                               ("Lookup label…", self.lookup_label, None)):
             s.popup_menu_add_command(label, fn, table_menu=False, index_menu=False,
                                      empty_space_menu=False, accelerator=acc)
         for label, fn, acc in (("Fill down", self.fill_down, "Ctrl+D"),
@@ -1441,15 +1929,17 @@ class App:
         self._on_select()
 
     # background jobs -------------------------------------------------------
-    def bg(self, label: str, work, done=None):
+    def bg(self, label: str, work, done=None, cancel=False):
         """Run work() in a thread, then done(result, seconds) on the UI thread with
         the same tab current. work must not read tab state (self.db etc.):
-        capture it before, the user may switch tabs meanwhile."""
+        capture it before, the user may switch tabs meanwhile. `cancel` offers the
+        Cancel button (for reads: Db.cancel stops the running statement)."""
         tab = self.tab
+        t0 = dt.datetime.now()
+        tab.job = (label, t0, cancel)
         self._busy = True
         self._refresh_buttons()
         self.msg(label + " …")
-        t0 = dt.datetime.now()
 
         def run():
             try:
@@ -1470,6 +1960,7 @@ class App:
 
                 def finish():
                     self._busy = False
+                    self.tab.job = None
                     if err:
                         self._show_error(err)
                     elif done:
@@ -1484,13 +1975,35 @@ class App:
                 self._conn_icon()
         except queue.Empty:
             pass
+        self._progress()
         self._poll_id = self.root.after(50, self._poll)
+
+    def _progress(self):
+        """Running job of the shown tab: elapsed time and rows read so far."""
+        t = self.shown
+        if not t or not t.job:
+            return
+        label, t0, _ = t.job
+        secs = (dt.datetime.now() - t0).total_seconds()
+        if secs < 0.5:
+            return
+        n = t.db.fetched if t.db.active is not None else 0
+        rows = f" · {n:,} rows" if n else ""
+        self.l_msg.configure(text=f"{label} …{rows} · {secs:.0f}s", style="Status.TLabel")
 
     def _refresh_buttons(self):
         for b in self.busy_buttons:
             b.state(["disabled"] if self._busy else ["!disabled"])
         if not self._busy:
             self._set_table_state(bool(self.cols))
+        job = self.shown.job if self.shown else None
+        if job and job[2]:
+            self.b_cancel.pack(side="right", padx=(8, 0))
+        else:
+            self.b_cancel.pack_forget()
+
+    def cancel_job(self):
+        self.shown.db.cancel()
 
     def _show_error(self, err):
         if isinstance(err, RowError):
@@ -1518,6 +2031,7 @@ class App:
         server, uid, pwd = self.v_server.get().strip(), self.v_uid.get().strip(), self.v_pwd.get()
         db = self.db
         self.conn_text = "Not connected"
+        self.tab.server = server
 
         def work():
             db.connect(server, uid, pwd)
@@ -1543,6 +2057,34 @@ class App:
 
         db = self.db
         self.bg("Listing tables", lambda: db.tables(database), done)
+
+    def _lookup_spec(self) -> dict | None:
+        """The lookup file from Settings, read fresh so edits apply on the next Load."""
+        try:
+            return load_lookup_file(self.settings.get("lookup_file", ""))
+        except (OSError, ValueError) as e:
+            self.msg(f"Lookup file: {e}", error=True)
+            return None
+
+    def _paste_where(self, e):
+        """A pasted column - header line, then one value per line, as copied from a
+        spreadsheet - becomes `header IN (values)`. Anything else pastes as text."""
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            return "break"
+        clause = in_clause(text, {c.name.lower(): c for c in self.table_cols or self.cols})
+        if clause is None:
+            return None  # plain paste (class binding)
+        w = e.widget
+        try:
+            w.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+        before = w.get().rstrip()
+        w.delete(0, "end")
+        w.insert(0, f"{before} AND {clause}" if before else clause)
+        return "break"
 
     def _filter_tables(self, e):
         if e.keysym in ("Return", "Up", "Down", "Escape"):
@@ -1574,9 +2116,14 @@ class App:
             return self.msg("Top must be a number", error=True)
 
         db = self.db
+        spec = self._lookup_spec()
+        if spec is None:
+            return
+        labels = dict(self.settings.get("fk_labels", {}))
 
         def work():
             cols = db.columns(database, table)
+            db.lookups(database, table, cols, spec, labels)
             return database, table, cols, db.load(database, table, cols, where, top)
 
         def done(res, secs):
@@ -1584,7 +2131,7 @@ class App:
             self._set_grid(database, table, cols, rows)
             self.msg(f"Loaded {len(rows):,} rows · {secs:.1f}s")
 
-        self.bg("Loading", work, done)
+        self.bg("Loading", work, done, cancel=True)
 
     def blank(self):
         src = self._source()
@@ -1595,13 +2142,21 @@ class App:
         def done(res, secs):
             database, table, cols = res
             self._set_grid(database, table, cols, [])
-            self.sheet.insert_rows(50)
-            self._schedule_marks()
             self.msg("Paste rows from Excel into the grid, or use Paste with headers to map "
                      "columns by name")
 
         db = self.db
-        self.bg("Reading columns", lambda: (database, table, db.columns(database, table)), done)
+        spec = self._lookup_spec()
+        if spec is None:
+            return
+        labels = dict(self.settings.get("fk_labels", {}))
+
+        def work():
+            cols = db.columns(database, table)
+            db.lookups(database, table, cols, spec, labels)
+            return database, table, cols
+
+        self.bg("Reading columns", work, done)
 
     def toggle_sql(self):
         self.tab.sql_open = not self.tab.sql_open
@@ -1616,12 +2171,14 @@ class App:
         if self.db.cn is None:
             return self.msg("Connect first", error=True)
         database, table = self.v_db.get(), self.v_table.get().strip()
-        if not database:
-            return self.msg("Pick a database", error=True)
         sql = self.t_sql.get("1.0", "end").strip()
         err = check_select(sql)
         if err:
             return self.msg(err, error=True)
+        spec = self._lookup_spec()
+        if spec is None:
+            return
+        labels = dict(self.settings.get("fk_labels", {}))
         try:
             top = max(1, int(self.v_top.get()))
         except ValueError:
@@ -1632,26 +2189,30 @@ class App:
         def work():
             names, rows = db.query(database, sql, top)
             srcs = db.sources(database, sql)
-            target = table
-            found = {(s[0], s[1]) for s in srcs or [] if s}
-            if len(found) == 1:  # every real column comes from one table: edit that one
-                target = "{}.{}".format(*found.pop())
-            table_cols = db.columns(database, target) if target else []
-            return target, table_cols, names, rows, srcs
+            tdb, target, table_cols = edit_target(db, database, table, srcs)
+            if table_cols:
+                db.lookups(tdb, target, table_cols, spec, labels)
+            tables = db.tables(tdb) if tdb and tdb != database else None
+            return tdb or database, target, table_cols, names, rows, srcs, tables
 
         def done(res, secs):
-            target, table_cols, names, rows, srcs = res
+            tdb, target, table_cols, names, rows, srcs, tables = res
+            if tables is not None:  # the result lives in another database: follow it
+                self.v_db.set(tdb)
+                self._all_tables = tables
+                self.cb_table.configure(values=tables)
+            database = tdb
             if target != table:
                 self.v_table.set(target)
-            cols, note = self._map_query_cols(target, table_cols, names, srcs,
+            cols, note = self._map_query_cols(database, target, table_cols, names, srcs,
                                               table_refs(sql, target) if target else 0)
             self._set_grid(database, target, cols, rows, table_cols, from_query=True)
             capped = f" (Top {top:,} reached)" if len(rows) == top else ""
             self.msg(f"Query returned {len(rows):,} rows{capped} · {secs:.1f}s{note}")
 
-        self.bg("Running query", work, done)
+        self.bg("Running query", work, done, cancel=True)
 
-    def _map_query_cols(self, table, table_cols, names, srcs, refs: int) -> tuple[list[Col], str]:
+    def _map_query_cols(self, database, table, table_cols, names, srcs, refs: int) -> tuple[list[Col], str]:
         """Editable only when SQL Server says the column comes from `table` itself.
         A column listed twice is the same column when the table is referenced once
         (`SELECT IssueDate, * FROM t`): both copies stay editable and are kept in
@@ -1665,9 +2226,9 @@ class App:
         if srcs is None or len(srcs) != len(names):
             return [shown(nm) for nm in names], (" · column sources could not be resolved, "
                                                  "result is read-only")
-        schema, tname = (x.lower() for x in split_table(table))
+        want = (database.lower(), *(x.lower() for x in split_table(table)))
         by_name = {c.name.lower(): c for c in table_cols}
-        hit = [by_name.get(s[2].lower()) if s and s[0].lower() == schema and s[1].lower() == tname
+        hit = [by_name.get(s[3].lower()) if s and tuple(x.lower() for x in s[:3]) == want
                else None for s in srcs]
         counts: dict[str, int] = {}
         for c in hit:
@@ -1700,6 +2261,7 @@ class App:
             rid = str(i)
             self.orig[rid] = r
             data.append(r + [rid])
+        data += [[""] * (len(cols) + 1) for _ in range(SPARE_ROWS)]
         n = len(cols)
         seen: dict[str, int] = {}
         for c in cols:  # header text must be unique (column moves are tracked by it);
@@ -1712,8 +2274,57 @@ class App:
         self.sheet.headers([c.label for c in cols] + ["__rid"])
         self.sheet.display_columns(list(range(n)), all_columns_displayed=False)
         self.sheet.readonly_columns([i for i, c in enumerate(cols) if c.readonly or c.audit], True)
+        self._dropdowns()
         self._fit_columns(data)
         self._marks()
+
+    def lookup_label(self):
+        """Header menu: correct what a foreign key dropdown shows beside the key
+        (or turn the dropdown off). Remembered for the referenced table."""
+        i = self._col()
+        if i is None:
+            return
+        col = self.cols[i]
+        if not col.ref_name:
+            return self.msg(f"{col.name} has no foreign key lookup", error=True)
+        pick = LabelDialog(self, col).result
+        if pick is None:
+            return
+        self.settings.setdefault("fk_labels", {})[col.ref_name] = pick
+        save_settings(self.settings)
+        tab, database, db = self.tab, self.database, self.db
+        cols = [c for c in self.cols if c.ref_name == col.ref_name]
+
+        def work():
+            if pick == NO_LOOKUP:
+                return None
+            return db._read(database, fk_lookup_sql(col.fk, pick), top=MAX_CHOICES + 1)[1]
+
+        def done(rows, secs):
+            for c in cols:
+                c.label_col = "" if pick == NO_LOOKUP else pick
+                if rows is None:
+                    c.choices, c.choice_list, c.picked, c.key_label = None, [], {}, {}
+                else:
+                    set_choices(c, rows, c.lookup or f"foreign key to {c.fk}")
+            if self.tab is tab:
+                self._dropdowns()
+                self._marks()
+                self.msg(f"{col.name}: " + ("no dropdown" if rows is None else
+                                            f"showing {pick}" if pick else "key only"))
+
+        self.bg("Reading lookup", work, done)
+
+    def _dropdowns(self):
+        """Lookup columns get a dropdown of their allowed values (blank = NULL first)."""
+        for i in list(self.sheet.MT.col_options):
+            if "dropdown" in self.sheet.MT.col_options[i]:
+                self.sheet.del_dropdown(self.sheet.span(num2alpha(i), header=False), redraw=False)
+        for i, c in enumerate(self.cols):
+            if c.choices is not None and not (c.readonly or c.audit):
+                self.sheet.dropdown(self.sheet.span(num2alpha(i), header=False), values=["", *c.choice_list],
+                                    edit_data=False, validate_input=False, redraw=False,
+                                    search_function=choice_search)
 
     def _fit_columns(self, data):
         ch = tkfont.Font(family=MONO[0], size=10).measure("0")
@@ -1721,17 +2332,24 @@ class App:
         widths = []
         for i, c in enumerate(self.cols):
             longest = max((len(r[i]) for r in data[:300]), default=0)
+            if c.choices is not None:  # room for the dropdown entries and the arrow
+                longest = max([longest, *(len(e) + 3 for e in c.choice_list[:300])])
             widths.append(min(320, max(80, hd.measure(c.label) + 28, longest * ch + 16)))
         self.sheet.set_column_widths(widths)
 
     # grid helpers ----------------------------------------------------------
     def _rows(self) -> list[list[str]]:
-        n = len(self.cols)
+        """Grid data as text, n columns + the hidden row id. Reads tksheet's own
+        lists: its per-cell getter is ~1 µs a cell, seconds on a big paste."""
+        n = len(self.cols) + 1
         out = []
-        for r in self.sheet.get_sheet_data():
-            r = [("" if v is None else str(v)) for v in r]
-            r += [""] * (n + 1 - len(r))
-            out.append(r[:n + 1])
+        for r in self.sheet.MT.data:
+            if len(r) == n and None not in r:  # the app only ever stores text
+                out.append(r[:])
+                continue
+            r = [("" if v is None else str(v)) for v in r[:n]]
+            r += [""] * (n - len(r))
+            out.append(r)
         return out
 
     def _twins(self) -> list[list[int]]:
@@ -1793,7 +2411,11 @@ class App:
         if t.label is not None and t.label.winfo_exists():
             t.label.configure(text=self._tab_text(t))
         if not self.cols:
+            self.bad = {}
             self.l_status.configure(text="")
+            for b, word in ((self.b_insert, "Insert"), (self.b_update, "Update")):
+                b.configure(text=word)
+                b.state(["disabled"])
             return
         rows = self._rows()
         self._sync_twins(rows)
@@ -1806,28 +2428,69 @@ class App:
             self.sheet.highlight_rows([gi], bg=C["new"], redraw=False)
         twin_of = {g[0]: g[1:] for g in self._twins()}
         cells = [(gi, x) for gi, _, ch in edited for ci in ch for x in [ci, *twin_of.get(ci, [])]]
+        for i, c in enumerate(self.cols):  # keys and lookups stand out in the header
+            if c.is_pk and not c.external:
+                self.sheet.highlight_cells(row=0, column=i, canvas="header", fg=C["accent"], redraw=False)
+            elif c.choices is not None or c.fk:
+                self.sheet.highlight_cells(row=0, column=i, canvas="header", fg=C["link"], redraw=False)
         filtered = [i for i, c in enumerate(self.cols) if c.label in self.filters]
         for i in filtered:
             self.sheet.highlight_cells(row=0, column=i, canvas="header", bg=C["accent_soft"],
                                        fg=C["accent"], redraw=False)
         if cells:
             self.sheet.highlight_cells(cells=cells, bg=C["edited"], redraw=False)
+        bad = self.bad = self._bad_cells(rows, new, edited)
+        if bad:
+            self.sheet.highlight_cells(cells=list(bad), bg=C["old"], fg=C["error"], redraw=False)
         self.sheet.redraw()
         writable = bool(self.table) and any(not c.readonly for c in self.cols)
-        for b, n, word in ((self.b_insert, len(new), "Insert"), (self.b_update, len(edited), "Update")):
-            b.configure(text=f"{word} {n:,} row{'s' if n != 1 else ''}" if n else f"{word} rows")
-            b.state(["!disabled"] if n and writable and not self._busy else ["disabled"])
+        bad_rows = {r for r, _ in bad}
+        for b, items, word in ((self.b_insert, new, "Insert"), (self.b_update, edited, "Update")):
+            n = len(items)
+            ok = n and writable and not self._busy and not any(it[0] in bad_rows for it in items)
+            b.configure(text=f"{word} {n:,}" if n else word)
+            b.state(["!disabled"] if ok else ["disabled"])
         if not writable:
-            self.l_status.configure(text=f"{self.tab.server}  ·  {self.database}  ·  query result  ·  {len(self.orig):,} rows"
-                                         "  ·  read-only, pick a table to edit")
-            return
-        key = ", ".join(k.name for k in self.keys) or "none"
-        src = "  ·  from query" if self.from_query else ""
-        if self.filters:
-            src += f"  ·  filtered {self._shown_rows():,} of {len(rows):,}"
-        self.l_status.configure(
-            text=f"{self.tab.server}  ·  {self.database}.{self.table}{src}  ·  {len(self.orig):,} loaded  ·  "
-                 f"{len(edited):,} edited  ·  {len(new):,} new  ·  key {key}")
+            parts = [self.tab.server, self.database, "query result", f"{len(self.orig):,} rows",
+                     "read-only: no table of its own to edit"]
+        else:
+            parts = [self.tab.server, f"{self.database}.{self.table}",
+                     "from query" if self.from_query else "",
+                     f"filtered {self._shown_rows():,} of {len(rows):,}" if self.filters else "",
+                     f"{len(self.orig):,} loaded", f"{len(edited):,} edited", f"{len(new):,} new",
+                     f"{len(bad):,} invalid" if bad else "",
+                     "key " + (", ".join(k.name for k in self.keys) or "none")]
+        self.l_status.configure(text="  ·  ".join(p for p in parts if p))
+        self._top_up(rows)
+
+    def _bad_cells(self, rows, new, edited) -> dict[tuple[int, int], str]:
+        """Cells that would fail on the server, with the reason: every filled cell of
+        a new row, and the changed cells of an edited row."""
+        bad = {}
+        checked = [(ci, col) for ci, col in enumerate(self.cols)
+                   if not (col.external or col.readonly or col.audit)]
+        for gi, vals in new:
+            for ci, col in checked:
+                v = vals[ci]
+                if v and (err := cell_error(col, v)):  # blank is always fine
+                    bad[gi, ci] = err
+        for gi, _, ch in edited:
+            for ci in ch:
+                err = cell_error(self.cols[ci], rows[gi][ci])
+                if err:
+                    bad[gi, ci] = err
+        return bad
+
+    def _top_up(self, rows):
+        """Keep empty rows under the data, as in a spreadsheet, for typing new records."""
+        n = len(self.cols)
+        spare = 0
+        for r in reversed(rows):
+            if any(v.strip() for v in r[:n]):
+                break
+            spare += 1
+        if spare < SPARE_ROWS // 2:
+            self.sheet.insert_rows(SPARE_ROWS - spare, redraw=True)
 
     def _ensure_keys(self) -> bool:
         if self.keys:
@@ -2111,6 +2774,64 @@ def paste_replace(e):
     return "break"
 
 
+class LabelDialog(tk.Toplevel):
+    """Which column of a referenced table to show beside its key in a dropdown."""
+    KEY, NONE = "(key only)", "(no dropdown)"
+
+    def __init__(self, app: "App", col: "Col"):
+        super().__init__(app.root)
+        self.result: str | None = None
+        self.title("Lookup label")
+        self.configure(bg=C["surface"])
+        self.transient(app.root)
+        self.resizable(False, False)
+        f = ttk.Frame(self, padding=16)
+        f.pack(fill="both")
+        ttk.Label(f, text=f"{col.name} refers to {col.fk}.\n"
+                         f"Which column should the dropdown show beside the key?",
+                  justify="left").pack(anchor="w", pady=(0, 8))
+        current = (self.NONE if col.choices is None else col.label_col or self.KEY)
+        self.v = tk.StringVar(value=current)
+        cb = ttk.Combobox(f, textvariable=self.v, values=[*col.label_options, self.KEY, self.NONE],
+                          state="readonly", width=36)
+        cb.pack(anchor="w")
+        ttk.Label(f, text="Remembered for this table. Settings can reset it.",
+                  style="Group.TLabel").pack(anchor="w", pady=(4, 12))
+        bar = ttk.Frame(f)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(bar, text="OK", style="Primary.TButton", command=self._ok).pack(side="right", padx=8)
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+        modal(self)
+        cb.focus_set()
+        self.wait_window()
+
+    def _ok(self):
+        v = self.v.get()
+        self.result = {self.KEY: "", self.NONE: NO_LOOKUP}.get(v, v)
+        self.destroy()
+
+
+class _NoTooltip(tk.Toplevel):
+    """Stand-in for tksheet's cell / header / index tooltip windows. tksheet
+    builds three per sheet up front and laying them out costs about a second
+    per sheet; this app never turns tksheet tooltips or notes on."""
+    cell_readonly = note_readonly = True
+
+    def __init__(self, parent, **_):
+        super().__init__(parent)
+        self.withdraw()
+        self.overrideredirect(True)
+
+    def reset(self, *a, **k):
+        pass
+
+
+for _m in (_tks_mt, _tks_ch, _tks_ri):
+    _m.Tooltip = _NoTooltip
+
+
 def modal(win: tk.Toplevel):
     """Grab input for a dialog; another app holding the grab is not fatal."""
     try:
@@ -2119,46 +2840,98 @@ def modal(win: tk.Toplevel):
         pass
 
 
-# ── title-bar icons: lucide "server" and "settings" (ISC licence, lucide.dev),
-# white 1.75 stroke rendered to 20px PNG and embedded so no image files ship
-ICON_SERVER = (
-    "iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqY"
-    "AAAXcJy6UTwAAAAGYktHRAAAAAAAAPlDu38AAAAJcEhZcwAAAYAAAAGAAB/kyyIAAAAHdElNRQfqCwkHODqlD58TAAAA"
-    "JXRFWHRkYXRlOmNyZWF0ZQAyMDI2LTExLTA5VDA3OjU2OjU4KzAwOjAwa6YT7AAAACV0RVh0ZGF0ZTptb2RpZnkAMjAy"
-    "Ni0xMS0wOVQwNzo1Njo1OCswMDowMBr7q1AAAAAodEVYdGRhdGU6dGltZXN0YW1wADIwMjYtMTEtMDlUMDc6NTY6NTgr"
-    "MDA6MDBN7oqPAAAA9UlEQVQ4y+3VQUoEMRAF0JexPYCLQQT1BnOO2XgF3buZE6gL9Qx6AK/gRo9ji4648ABql5sKNMKg"
-    "3cxG8EMgFJXkV+X/pESExBTbKIYh8IJXaDI4xzn2MmEIClqc4a5ExBS32MANPnqJv2HX4BCfOBARs4h4iohFRBg5FrnH"
-    "rMEkT6vMjjN2hShlNdFe/+vaycSa0aDrzeF6BYuf9oGuwTJv6Sib/D6Q1GaubbEsyWCOC+yPrPQBp1U2NbiV4h7a1y5F"
-    "/davXequGyHs6Gu275RL7I4s+REn/05ZD/6WU+oDWwZosea26ZT78u0L2BnplOf6BXwBhnfdmVQkYpcAAAAASUVORK5C"
-    "YII="
-)
-ICON_SETTINGS = (
-    "iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqY"
-    "AAAXcJy6UTwAAAAGYktHRAAAAAAAAPlDu38AAAAJcEhZcwAAAYAAAAGAAB/kyyIAAAAHdElNRQfqCwkHODqlD58TAAAA"
-    "JXRFWHRkYXRlOmNyZWF0ZQAyMDI2LTExLTA5VDA3OjU2OjU3KzAwOjAwne5jBQAAACV0RVh0ZGF0ZTptb2RpZnkAMjAy"
-    "Ni0xMS0wOVQwNzo1Njo1NyswMDowMOyz27kAAAAodEVYdGRhdGU6dGltZXN0YW1wADIwMjYtMTEtMDlUMDc6NTY6NTgr"
-    "MDA6MDBN7oqPAAAB1ElEQVQ4y7WVMU9UQRSFvweijSxIog2FLqXVEiVKoX9BGwsbCRX/wQKttpJGwMbEdhMrrSwxsTBG"
-    "CmhMiFHEZCtjgiyNWnw2520mG1Yx0UlOMnPn3Pvmzr1zXsWQodbTk8D5zPeAHwBVVXHsodaYUtfUvWAttvKDvw0wiCW1"
-    "pz5QVzJfGsY/KtiYOl6sn6jbaiPYjq3eH49PP8aJ4qAt4C4wA7wGesANoAMchvMKuA20gXFgHviY9VZ5wil1Q91VO+p7"
-    "tas+VqeLE0zH1g2nE5+N+m5r4nX1QF0oHJvqqDqhzgcTsTWLDy2o39RrKiNJpQd8B+aABtAFdnMNz4AXwXNgNnvdcOfS"
-    "SodlymPqvaKiI+qZpLKjLgY7sU2GU1d+uS5OWeFR9ZH6QT2rXlX3E6jmLMZ2RT0X7np8KVPut+Rx+v44r6JMeSXpTP5F"
-    "yvcHU55Vv+RpNYoULyXAfvBSvVzsN9TV+M6WjX0aOAW8BQ6A6YjCFnATuBjeu1Szmcp2gU3gTmL8v8ZGbalP1U31odpW"
-    "v+YaRoK12NrhbMan1ReIfy4OVVWV2vYzqMcb4BawnPUMsF7s98qOGSq6Rwjs5wjsal7QUIEdquMDv4ALmX/60y/gFxg+"
-    "RTp+xY3bAAAAAElFTkSuQmCC"
-)
+def _rgb(color: str) -> tuple[int, int, int]:
+    return int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+
+
+@functools.lru_cache(maxsize=None)
+def _coverage(w: int, h: int, r: float) -> tuple[tuple[tuple[float, float], ...], ...]:
+    """Per pixel (outer, inner) coverage of a rounded rectangle with a 1px border,
+    4x4 supersampled. Colour-free, so every button state and theme reuses it."""
+    ss = 4
+
+    def inside(px, py, x0, y0, x1, y1, rr):
+        cx, cy = min(max(px, x0 + rr), x1 - rr), min(max(py, y0 + rr), y1 - rr)
+        return x0 <= px <= x1 and y0 <= py <= y1 and (px - cx) ** 2 + (py - cy) ** 2 <= rr * rr
+
+    rows = []
+    for y in range(h):
+        row = []
+        for x in range(w):
+            outer = inner = 0
+            for sy in range(ss):
+                for sx in range(ss):
+                    px, py = x + (sx + .5) / ss, y + (sy + .5) / ss
+                    if inside(px, py, 0, 0, w, h, r):
+                        outer += 1
+                        inner += inside(px, py, 1, 1, w - 1, h - 1, r - 1)
+            row.append((outer / ss ** 2, inner / ss ** 2))
+        rows.append(tuple(row))
+    return tuple(rows)
+
+
+def rounded(w: int, h: int, r: float, fill: str, border: str, bg: str) -> tk.PhotoImage:
+    """Anti-aliased rounded rectangle with a 1px border, flattened onto `bg`
+    (images on Tk widgets have no alpha blending with what is behind them)."""
+    f, b, g = _rgb(fill), _rgb(border), _rgb(bg)
+    rows = []
+    for cov in _coverage(w, h, r):
+        rows.append("{" + " ".join(
+            "#%02x%02x%02x" % tuple(round(g[k] * (1 - o) + b[k] * (o - i) + f[k] * i) for k in range(3))
+            for o, i in cov) + "}")
+    img = tk.PhotoImage(width=w, height=h)
+    img.put(" ".join(rows))
+    return img
+
+
+class Hint:
+    """Muted placeholder text inside an entry or combobox while it is empty."""
+
+    def __init__(self, app: "App", widget, var: tk.StringVar, text: str):
+        self.widget, self.var = widget, var
+        self.label = app.paint(tk.Label(widget, text=text, font=FONT, cursor="xterm", padx=0, pady=0),
+                               bg="surface", fg="muted")
+        self.label.bind("<Button-1>", lambda e: widget.focus_set())
+        var.trace_add("write", lambda *a: self.update())
+        widget.bind("<FocusIn>", lambda e: self.update(), add="+")
+        widget.bind("<FocusOut>", lambda e: self.update(), add="+")
+        self.update()
+
+    def update(self):
+        try:
+            typing = self.widget.focus_get() is self.widget
+        except (KeyError, tk.TclError):  # focus in a dropdown list
+            typing = False
+        if self.var.get() or (typing and "readonly" not in self.widget.state()):
+            self.label.place_forget()
+        else:
+            self.label.place(x=9, rely=0.5, anchor="w")
+
+
+class MenuItem:
+    """A menu entry that answers .state([...]) like a ttk button, so it can sit in
+    the same enable / disable lists."""
+
+    def __init__(self, menu: tk.Menu, label: str, command):
+        menu.add_command(label=label, command=command)
+        self.menu, self.index = menu, menu.index("end")
+
+    def state(self, spec):
+        self.menu.entryconfigure(self.index, state="disabled" if "disabled" in spec else "normal")
 
 
 class IconButton(tk.Canvas):
-    """32px icon on the title band with hover fill and a tooltip. `dot` adds a
+    """32px toolbar icon with a rounded hover fill and a tooltip. `dot` adds a
     status dot (offline grey / online green) at the bottom-right corner."""
 
-    def __init__(self, app: "App", parent, icon_b64: str, command, tip, dot=False):
+    def __init__(self, app: "App", parent, icon: str, command, tip, dot=False):
         super().__init__(parent, width=32, height=32, highlightthickness=0, bd=0, cursor="hand2")
-        self.img = tk.PhotoImage(data=icon_b64, format="png")
+        self.app, self.icon = app, icon
         self.command, self.tip = command, tip
         self.dot: str | None = "offline" if dot else None
         self.hover = False
         self._tipwin = None
+        self._fill = None
         self.bind("<Enter>", lambda e: self._set_hover(True))
         self.bind("<Leave>", lambda e: self._set_hover(False))
         self.bind("<Button-1>", lambda e: (self._hide_tip(), self.command()))
@@ -2166,11 +2939,14 @@ class IconButton(tk.Canvas):
 
     def redraw(self):
         self.delete("all")
-        self.configure(bg=C["button_hover"] if self.hover else C["band"])
-        self.create_image(16, 16, image=self.img)
+        self.configure(bg=C["surface"])
+        if self.hover:
+            self._fill = rounded(32, 32, 6, C["hover"], C["hover"], C["surface"])
+            self.create_image(16, 16, image=self._fill)
+        self.create_image(16, 16, image=self.app.icon(self.icon))
         if self.dot:
-            fill = "#7ee2a8" if self.dot == "online" else "#a8b3ad"
-            self.create_oval(21, 21, 29, 29, fill=fill, outline=C["band"], width=2)
+            fill = C["accent"] if self.dot == "online" else C["disabled"]
+            self.create_oval(21, 21, 28, 28, fill=fill, outline=C["surface"], width=2)
 
     def _set_hover(self, on: bool):
         self.hover = on
@@ -2216,10 +2992,47 @@ class SettingsDialog(tk.Toplevel):
                          "Insert shows the new rows. Nothing is sent until you confirm.",
                   style="Group.TLabel", justify="left").grid(row=2, column=0, columnspan=2,
                                                             sticky="w", pady=(2, 12))
-        ttk.Label(f, text=f"Version {VERSION}", style="Group.TLabel").grid(row=3, column=0, sticky="w")
-        ttk.Button(f, text="Close", command=self.destroy).grid(row=3, column=1, sticky="e")
+        ttk.Label(f, text="Lookup file").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=4)
+        row = ttk.Frame(f)
+        row.grid(row=3, column=1, sticky="we", pady=4)
+        self.v_lookup = tk.StringVar(value=app.settings.get("lookup_file", ""))
+        ttk.Entry(row, textvariable=self.v_lookup, width=34, state="readonly").pack(side="left")
+        ttk.Button(row, text="Choose…", command=lambda: self._lookup(app, True)).pack(side="left", padx=(8, 0))
+        ttk.Button(row, text="Clear", command=lambda: self._lookup(app, False)).pack(side="left", padx=(4, 0))
+        ttk.Label(f, text="JSON of allowed values per column (see README). Foreign keys get a\n"
+                         "dropdown on their own. Applies on the next Load or Run.",
+                  style="Group.TLabel", justify="left").grid(row=4, column=0, columnspan=2,
+                                                            sticky="w", pady=(2, 12))
+        self.v_ime = tk.BooleanVar(value=app.settings.get("ime", False))
+        ttk.Checkbutton(f, text="Input method (IME) for composed characters, applies on restart",
+                        variable=self.v_ime, command=lambda: self._ime(app)
+                        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        ttk.Button(f, text="Forget lookup label choices",
+                   command=lambda: (app.settings.pop("fk_labels", None), save_settings(app.settings),
+                                    app.msg("Lookup labels reset; applies on the next Load"))
+                   ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        ttk.Label(f, text=f"Version {VERSION}", style="Group.TLabel").grid(row=7, column=0, sticky="w")
+        ttk.Button(f, text="Close", command=self.destroy).grid(row=7, column=1, sticky="e")
         self.bind("<Escape>", lambda e: self.destroy())
         modal(self)
+
+    def _ime(self, app: "App"):
+        app.settings["ime"] = self.v_ime.get()
+        save_settings(app.settings)
+
+    def _lookup(self, app: "App", choose: bool):
+        path = ""
+        if choose:
+            path = filedialog.askopenfilename(parent=self, filetypes=[("Lookup JSON", "*.json"), ("All", "*")])
+            if not path:
+                return
+            try:
+                load_lookup_file(path)
+            except (OSError, ValueError) as e:
+                return messagebox.showerror("Lookup file", str(e), parent=self)
+        self.v_lookup.set(path)
+        app.settings["lookup_file"] = path
+        save_settings(app.settings)
 
     def _theme(self, app: "App"):
         app._toggle_setting("theme")

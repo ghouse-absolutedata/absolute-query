@@ -6,17 +6,29 @@ through the `keyring` package. Without keyring, passwords are never stored.
 """
 from __future__ import annotations
 
-try:
-    import keyring
-    from keyring.errors import KeyringError
-except ImportError:  # optional dependency
-    keyring = None
-    KeyringError = Exception
+import functools
 
 SERVICE = "AbsoluteQuery"
 
 
+class _NoKeyring(Exception):
+    pass
+
+
+@functools.lru_cache(maxsize=None)
+def _keyring():
+    """keyring, imported on first use: it costs ~0.1s, and many starts need no password."""
+    try:
+        import keyring
+        from keyring.errors import KeyringError
+    except ImportError:  # optional dependency
+        return None, _NoKeyring
+    return keyring, KeyringError
+
+
+@functools.lru_cache(maxsize=None)
 def keychain_ok() -> bool:
+    keyring, _ = _keyring()
     if keyring is None:
         return False
     try:
@@ -36,6 +48,7 @@ def find(settings: dict, name: str) -> dict | None:
 def get_password(name: str) -> str:
     if not keychain_ok():
         return ""
+    keyring, KeyringError = _keyring()
     try:
         return keyring.get_password(SERVICE, name) or ""
     except KeyringError:
@@ -57,6 +70,7 @@ def save(settings: dict, name: str, server: str, user: str, pwd: str, remember: 
     if not keychain_ok():
         entry["remember"] = False
         return "Password not saved: OS keychain unavailable (pip install keyring)" if remember else None
+    keyring, KeyringError = _keyring()
     try:
         if remember and pwd:
             keyring.set_password(SERVICE, name, pwd)
@@ -77,6 +91,7 @@ def delete(settings: dict, name: str) -> None:
 
 def _forget(name: str) -> None:
     if keychain_ok():
+        keyring, KeyringError = _keyring()
         try:
             keyring.delete_password(SERVICE, name)
         except KeyringError:

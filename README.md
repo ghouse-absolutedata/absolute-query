@@ -22,6 +22,51 @@ Windows and Linux.
    - Linux: `chmod +x AbsoluteQuery-linux && ./AbsoluteQuery-linux`
 4. Click the server icon (top right) to add a connection.
 
+## Using it
+
+- **Load** a table, with an optional *Where* and *Top*. Paste a column copied from
+  a spreadsheet (header line, then values) into *Where* to get `Header IN (...)`.
+- **SQL** runs any single `SELECT` / `WITH`. You don't need to pick a database or
+  table first. The result can be edited in the table its columns come from.
+  Joined and computed columns are read-only.
+- Reads never lock: every read runs `READ UNCOMMITTED`, the same as `NOLOCK`.
+  Long reads show rows read so far and can be cancelled.
+- Values are checked against the column type. Typed bad values are refused.
+  Pasted bad values are marked red, and Insert / Update wait until they are fixed.
+- Key columns have accent headers. Columns with allowed values have blue headers
+  and a dropdown; hover a header for its type and key details.
+
+### Lookup file
+
+Foreign keys get a dropdown on their own, with a text column of the referenced
+table shown beside each key (`3 · ISIN`). The cell keeps only the key. The label
+column is picked automatically: a `…Name` column first, then `…Description`, then
+`…Code`. If the pick is wrong, right-click the column header and choose *Lookup
+label…*. From there you can pick another column, show the key only, or turn the
+dropdown off. The choice is remembered, and *Forget lookup label choices* in
+Settings resets it.
+
+You can type a key, a label, or part of a label in the cell or the fx bar. The
+dropdown jumps to the matching entry, and Enter stores its key: `valoren` becomes
+`6`.
+
+For other columns, choose a JSON lookup file in Settings. A `SELECT` with two
+columns shows the second beside the first in the same way:
+
+```json
+{
+  "Sales.dbo.Orders.Status": ["Open", "Shipped", "Closed"],
+  "dbo.Orders.Currency": {"sql": "SELECT Code FROM dbo.Currency", "database": "Ref"},
+  "CountryCode": {"sql": "SELECT Code FROM dbo.Country"}
+}
+```
+
+A key names a column as `database.schema.table.column`, `schema.table.column`,
+`table.column`, or just `column` for any table. The most specific key wins. A
+value is either the list of allowed values or a `SELECT` returning them. Only
+those values, or blank for NULL, are accepted. Edits to the file apply on the
+next Load or Run.
+
 **Updates are automatic.** Each start checks this repository and runs the newest
 code. There is nothing to clone or reinstall. Without network access, the last
 downloaded version runs. Settings (gear icon) shows the running version.
