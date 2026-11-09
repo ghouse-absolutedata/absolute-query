@@ -35,6 +35,58 @@ Windows and Linux.
   Pasted bad values are marked red, and Insert / Update wait until they are fixed.
 - Key columns have accent headers. Columns with allowed values have blue headers
   and a dropdown; hover a header for its type and key details.
+- Lookup labels: Settings → *Lookup labels* sets how an id shows with its label.
+  *Format* takes your own text with `{id}` and `{label}` (`{id} - {label}`,
+  `{label} ({id})`, `{label}`); *Field separator* goes between several shown fields
+  (` · `, ` - `, ` | ` or your own). Display only: the database gets the id.
+- Scratch columns: right-click a header → *Add scratch column* for a column of your
+  own, for notes or working things out with formulas. It stays on the sheet until the
+  next Load and is never written: Insert / Update skip it, and a row with only a
+  scratch value is not a new row. *Rename…* / *Remove* from the same menu.
+- **Ctrl+F** finds a value, including the lookup label shown with an id.
+  **Ctrl+Shift+F** jumps to a column by name.
+
+### Formulas
+
+Start a cell with `=`, as in Excel. The rest is a SQL Server expression, and it can
+use other cells. The cell shows the result and keeps the formula: select it to see
+the formula in the fx bar, press F2 to edit it. When a cell it uses changes, it is
+calculated again. Insert / Update write the result.
+
+| Type in a cell | Means |
+|---|---|
+| `=UPPER(ISIN)` | ISIN of the same row, in capitals |
+| `=[Issue Date]` | a column whose name has spaces or is a SQL word |
+| `=UPPER(B2)` | the cell in column B, row 2 |
+| `=$B$2 * 2` | `$` keeps the column / row fixed when copied |
+| `=SUM(C2:C10)` | `SUM`, `MIN`, `MAX`, `AVG` / `AVERAGE`, `COUNT` over a range |
+| `=DATEADD(month, 1, IssueDate)` | any SQL Server function |
+| `=GETDATE()`, `=NEWID()` | no cell needed; `NEWID()` differs in every cell |
+| `=TRIM('  QC  9 ')` | text goes in single quotes |
+| `=(SELECT MAX(EntityID) FROM FI_EntityMaster.dbo.EntityMaster)` | a read-only subquery |
+
+- While typing a formula, click a cell to put its reference in; drag for a range;
+  after an operator, the arrow keys point at cells too. Settings → *Formula
+  references* picks what a click on the same row puts in: the column name
+  (`ISIN`, the default) or the cell (`A2`). Other rows always give `A2`.
+- Fill down / right (Ctrl+D, Ctrl+R, the fill handle) and copy / paste move cell
+  references, as in Excel: `=UPPER(B2)` filled down becomes `=UPPER(B3)`. `$B$2`
+  stays, and column names always mean the row the formula is in.
+- Text needs quotes: `=TRIM('QC  9')`. Without them `QC` is read as a column name.
+- Referenced values are read as their column's type, and the result is converted
+  to the type of the cell's column, so `=GETDATE()` fits a date column.
+- Inside a subquery, name the table's columns with the table
+  (`t.EntityID`): a bare name that matches a column of the sheet means that cell.
+- A formula that cannot be worked out keeps its cell red; hover it for why
+  (server error, a missing cell, a circular reference). Insert / Update wait until
+  every formula has a result.
+- Read-only: a formula with `INSERT`, `UPDATE`, `DELETE`, `DROP`, `;` and the like
+  is refused.
+- Typing a value over a formula cell replaces the formula. Formulas last until the
+  sheet is loaded again; a value stored in the table that starts with `=` is never
+  calculated.
+- Cells with the same formula shape (one filled down) are calculated in one query,
+  so thousands of rows take about as long as one.
 
 ### Lookup file
 

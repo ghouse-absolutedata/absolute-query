@@ -111,7 +111,7 @@ import threading
 import tkinter as tk
 from decimal import Decimal
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter import font as tkfont
 
 import pyodbc
@@ -274,6 +274,7 @@ class Col:
         self.src: dict | None = None
         self.of: Col | None = None  # set on a label column: the lookup column it describes
         self.part: int | None = None  # label column of one field: its index in of.label_fields
+        self.scratch = False  # a column of your own on this sheet: editable, never written
         # a lookup too big to list (over MAX_CHOICES rows): the server is asked per value.
         # key_fields / key_label then hold the values found so far, `missing` those not in it,
         # `nomatch` typed text that named no single row (-> why)
@@ -400,6 +401,37 @@ class Db:
             raise
         finally:
             self.active = None
+
+    def eval_fx(self, database: str, sql: str, items: list[dict]) -> dict[int, str | Exception]:
+        """Run a formula query (fx_sql) for `items`, 2,000 cells a query. A failing
+        query is split until the failing cells are found; an error in the formula
+        itself (syntax, unknown function) is found with one cell and given to all."""
+        out: dict[int, str | Exception] = {}
+        budget = [200]  # queries spent on isolating errors
+
+        def run(chunk):
+            try:
+                for r in self._read(database, sql, (json.dumps(chunk),))[1]:
+                    out[int(r[0])] = r[1]
+                return
+            except pyodbc.Error as e:
+                if self.cancelled:
+                    raise
+                err = e
+            if len(chunk) == 1 or budget[0] <= 0:
+                out.update({it["i"]: err for it in chunk})
+                return
+            budget[0] -= 1
+            if "42000" in str(err) or "42S" in str(err):  # compile error: every cell has it
+                out.update({it["i"]: err for it in chunk})
+                return
+            half = len(chunk) // 2
+            run(chunk[:half])
+            run(chunk[half:])
+
+        for k in range(0, len(items), 2000):
+            run(items[k:k + 2000])
+        return out
 
     def begin(self):
         """A new job starts: earlier cancels no longer apply."""
@@ -777,7 +809,7 @@ def build_insert(table, cols: list[Col], table_cols: list[Col]) -> tuple[str, li
     schema, name = split_table(table)
     data_cols, seen = [], set()
     for c in cols:  # a column shown twice is inserted once
-        if not c.readonly and c.audit is None and c.name.lower() not in seen:
+        if not c.readonly and not c.scratch and c.audit is None and c.name.lower() not in seen:
             seen.add(c.name.lower())
             data_cols.append(c)
     tgt = [q(c.name) for c in data_cols]
@@ -867,14 +899,164 @@ def sql_type(col: "Col") -> str:
     return ""
 
 
-def formula_sql(expr: str, n: int, cast: str = "") -> str:
-    """SELECT giving `n` values of `expr` as type `cast`; one row each, so NEWID()
-    differs per cell."""
-    v = f"CAST(({expr}) AS {cast})" if cast else f"({expr})"
-    if n == 1:
-        return f"SELECT {v} AS v"
-    return (f"SELECT {v} AS v FROM (SELECT TOP ({n}) 1 AS x FROM sys.all_columns a "
-            f"CROSS JOIN sys.all_columns b) t")
+class FxError(Exception):
+    """A formula that cannot be worked out (bad reference, circular, server error)."""
+
+
+# Formulas: "=" + a SQL Server expression. Other cells are referenced Excel style
+# (B2, $B$2, SUM(B2:B9)) or by column name (ISIN, [Issue Date]) for the same row.
+FX_AGG = {"sum": "SUM", "min": "MIN", "max": "MAX", "avg": "AVG", "average": "AVG", "count": "COUNT"}
+_A1 = r"\$?[A-Za-z]{1,3}\$?\d+"
+_FX_TOKEN = re.compile(rf"""
+    (?P<str>N?'(?:[^']|'')*')
+  | (?P<agg>(?<![\w.])(?:SUM|MIN|MAX|AVG|AVERAGE|COUNT)\s*\(\s*{_A1}:{_A1}\s*\))
+  | (?P<br>\[(?:[^\]]|\]\])+\])
+  | (?P<cell>(?<![\w.@#$]){_A1}(?::{_A1})?(?![\w(.]))
+  | (?P<word>(?<![\w@#$])[A-Za-z_@#][\w@#$]*)""", re.X | re.I)
+_FX_A1 = re.compile(r"(\$?)([A-Za-z]{1,3})(\$?)(\d+)")
+SQL_WORDS = {"as", "and", "or", "not", "null", "is", "in", "like", "between", "case", "when", "then", "else",
+             "end", "select", "from", "where", "date", "time", "day", "month", "year", "key", "type", "value"}
+
+
+def col_index(letters: str) -> int:
+    n = 0
+    for ch in letters.upper():
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
+
+def fx_names(cols: list["Col"]) -> dict[str, int]:
+    """Column name / header (lower case) -> grid index; label columns excluded."""
+    names: dict[str, int] = {}
+    for i, c in enumerate(cols):
+        if c.of is None:
+            names.setdefault(c.name.lower(), i)
+            names.setdefault(c.label.lower(), i)
+    return names
+
+
+def fx_ref_name(col: "Col") -> str:
+    """How a column is written in a formula: ISIN, or [Issue Date] when it needs brackets."""
+    plain = re.fullmatch(r"[A-Za-z_][\w]*", col.label) and col.label.lower() not in SQL_WORDS \
+        and not re.fullmatch(_A1, col.label)
+    return col.label if plain else "[" + col.label.replace("]", "]]") + "]"
+
+
+def _a1(tok: str) -> tuple[int, int, bool]:
+    """'$B$7' -> (column 1, row 6, row is absolute)"""
+    cabs, letters, rabs, num = _FX_A1.fullmatch(tok).groups()
+    return col_index(letters), int(num) - 1, bool(rabs)
+
+
+def fx_parse(text: str, gi: int, cols: list["Col"], nrows: int):
+    """Formula of data row `gi` -> (pieces, refs, shape). pieces: SQL text and ref
+    numbers; refs: ("cell", column, row) or ("agg", FUNC, [(row, column), ...]);
+    shape: the formula with references made relative to the row, equal for every
+    cell that can share one query (a filled-down formula)."""
+    body, names = text[1:], fx_names(cols)
+    pieces: list = []
+    refs: list = []
+    shape: list[str] = []
+    pos, prev = 0, ""
+
+    def cell(ci: int, ri: int, row_abs: bool, tok: str) -> str:
+        if not 0 <= ci < len(cols) or cols[ci].of is not None:
+            raise FxError(f"{tok}: no such column")
+        if not 0 <= ri < nrows:
+            raise FxError(f"{tok}: row {ri + 1} does not exist")
+        return f"C{ci}{'$' if row_abs else '@'}{ri if row_abs else ri - gi}"
+
+    for m in _FX_TOKEN.finditer(body):
+        gap = body[pos:m.start()]
+        pieces.append(gap)
+        shape.append(gap)
+        pos = m.end()
+        tok, kind = m.group(), m.lastgroup
+        before, after = body[:m.start()].rstrip(), body[m.end():].lstrip()
+        ci = None
+        if kind == "br":
+            ci = names.get(tok[1:-1].replace("]]", "]").lower())
+        elif kind in ("word", "cell") and tok.lower() in names and not after.startswith(("(", ".")) \
+                and not before.endswith(".") and prev != "as":
+            ci = names[tok.lower()]
+        if ci is not None:  # a column of the same row
+            refs.append(("cell", ci, gi))
+            pieces.append(len(refs) - 1)
+            shape.append(f"\x00C{ci}@0\x00")
+        elif kind == "cell":
+            if ":" in tok:
+                raise FxError(f"{tok}: a range works inside SUM, MIN, MAX, AVG or COUNT")
+            c, r, ra = _a1(tok)
+            shape.append(f"\x00{cell(c, r, ra, tok)}\x00")
+            refs.append(("cell", c, r))
+            pieces.append(len(refs) - 1)
+        elif kind == "agg":
+            fn = FX_AGG[re.match(r"\w+", tok).group().lower()]
+            a, b = re.search(rf"({_A1}):({_A1})", tok).groups()
+            (c0, r0, a0), (c1, r1, a1) = _a1(a), _a1(b)
+            spec = f"{cell(c0, r0, a0, a)}:{cell(c1, r1, a1, b)}"
+            r0, r1, c0, c1 = min(r0, r1), max(r0, r1), min(c0, c1), max(c0, c1)
+            refs.append(("agg", fn, [(r, c) for r in range(r0, r1 + 1) for c in range(c0, c1 + 1)]))
+            pieces.append(len(refs) - 1)
+            shape.append(f"\x00{fn}({spec})\x00")
+        else:
+            pieces.append(tok)
+            shape.append(tok)
+        prev = tok.lower() if kind == "word" else ""
+    pieces.append(body[pos:])
+    shape.append(body[pos:])
+    return pieces, refs, "".join(shape)
+
+
+def fx_shift(text: str, dr: int, dc: int, cols: list["Col"]) -> str:
+    """A formula copied `dr` rows down / `dc` columns right: B2 -> B3, $B$2 stays.
+    Column names refer to the same row, so they stay as they are."""
+    if not (dr or dc) or not is_formula(text):
+        return text
+    names, body = fx_names(cols), text[1:]
+
+    def move(m):
+        cabs, letters, rabs, num = m.groups()
+        ci = col_index(letters) + (0 if cabs else dc)
+        ri = int(num) - 1 + (0 if rabs else dr)
+        return "#REF!" if ci < 0 or ri < 0 else f"{cabs}{num2alpha(ci)}{rabs}{ri + 1}"
+
+    out, pos = [], 0
+    for m in _FX_TOKEN.finditer(body):
+        tok, kind = m.group(), m.lastgroup
+        out.append(body[pos:m.start()])
+        pos = m.end()
+        if (kind == "cell" and tok.lower() not in names) or kind == "agg":
+            tok = re.sub(rf"(?<![\w$]){_FX_A1.pattern}(?!\w)", move, tok) if kind == "agg" \
+                else ":".join(_FX_A1.sub(move, part) for part in tok.split(":"))
+        out.append(tok)
+    out.append(body[pos:])
+    return "=" + "".join(out)
+
+
+def fx_sql(pieces: list, refs: list, cols: list["Col"], cast: str) -> str:
+    """One query for all cells of a shape: each cell is a row of the JSON parameter
+    ({"i": n, "p0": value, ...}); referenced values are converted to their column's type."""
+    withs, expr = ["[i] int '$.i'"], []
+    for p in pieces:
+        if isinstance(p, str):
+            expr.append(p)
+            continue
+        ref = refs[p]
+        if ref[0] == "cell":
+            withs.append(f"[p{p}] nvarchar(max) '$.p{p}'")
+            t = sql_type(cols[ref[1]])
+            expr.append(f"TRY_CONVERT({t}, j.[p{p}])" if t else f"j.[p{p}]")
+        else:
+            withs.append(f"[p{p}] nvarchar(max) '$.p{p}' AS JSON")
+            t = sql_type(cols[ref[2][0][1]]) if ref[2] else ""
+            if not t and ref[1] in ("SUM", "AVG"):
+                t = "float"
+            v = f"TRY_CONVERT({t}, value)" if t else "value"
+            expr.append(f"(SELECT {ref[1]}({v}) FROM OPENJSON(j.[p{p}]))")
+    e = "".join(expr)
+    v = f"CAST(({e}) AS {cast})" if cast else f"({e})"
+    return f"SELECT j.[i], {v} AS v FROM OPENJSON(?) WITH ({', '.join(withs)}) j"
 
 
 def cell_error(col: "Col", v: str) -> str | None:
@@ -895,6 +1077,8 @@ def cell_error(col: "Col", v: str) -> str | None:
 
 def col_info(col: "Col") -> str:
     """'ISIN · varchar(12) · primary key · lookup: foreign key to dbo.Bond.ISIN'"""
+    if col.scratch:
+        return f"{col.label} · scratch column: on this sheet only, never written to the database"
     if col.external:
         return f"{col.label} · not from the target table, read-only"
     t = col.type
@@ -994,7 +1178,24 @@ MISMATCH = {"⚠ before the value": "mark", "Red text": "red", "Both": "both"}
 WARN = "⚠ "
 
 
-LABEL_SEP = " · "  # between label fields
+LABEL_SEP = " · "  # between label fields; Settings can change it (set_label_sep)
+LABEL_SEPS = [" · ", " - ", " | ", ", ", " / "]
+
+
+def set_label_sep(sep: str) -> None:
+    global LABEL_SEP
+    LABEL_SEP = sep or " · "
+
+
+def label_format_error(fmt: str) -> str | None:
+    """Why a label format cannot be used, or None. It needs {label}; {id} is optional."""
+    if "{label}" not in fmt:
+        return "The format needs {label}, e.g. {id} - {label}"
+    try:
+        fmt.format(id="6", label="Valoren")
+    except (KeyError, IndexError, ValueError):
+        return "Only {id} and {label} can be used; write {{ or }} for a brace"
+    return None
 
 
 def label_fields(src: dict) -> list[str]:
@@ -1022,9 +1223,11 @@ def field_text(col: "Col", part: int, fv: str, mark: bool) -> str:
 
 def label_of(col: "Col", v: str, mark: bool) -> str:
     """All label fields of key `v`, joined; fields with their own lookup show its label."""
-    if not col.subs:
+    vals = col.key_fields.get(v)
+    if vals is None:
         return col.key_label.get(v, "")
-    vals = col.key_fields.get(v, ())
+    if not col.subs:  # joined now, so a new separator shows at once
+        return LABEL_SEP.join(str(x) for x in vals if x not in (None, ""))
     return LABEL_SEP.join(t for p, fv in enumerate(vals) if (t := field_text(col, p, str(fv), mark)))
 
 
@@ -1247,9 +1450,9 @@ class Tab:
         self.note = ("Ready", False)
         self.job: tuple | None = None  # (label, started, cancellable) while a job runs
         self.bad: dict[tuple[int, int], str] = {}  # (data row, column) -> why the value is invalid
-        self.fx_out: set[str] = set()  # values formulas produced: never evaluated again
-        self.fx_err: dict[str, str] = {}  # formula -> server error, not retried until edited
-        self.fx_hold = False  # evaluation cancelled or failed: wait for the next typed formula
+        self.fx: dict[int, tuple[list, dict[int, dict]]] = {}  # id(row) -> (row, {column: formula})
+        self.fx_why: dict[tuple[int, int], str] = {}  # formula cells not calculated, and why
+        self.fx_hold = False  # calculation cancelled or failed: wait for the next entered formula
         self.lk_hold = False  # same for reading big lookups
         self.label: tk.Label | None = None  # its tab in the tab strip
 
@@ -1282,6 +1485,7 @@ class App:
         root.geometry("1440x860")
         root.minsize(1100, 520)
         self.settings = load_settings()
+        set_label_sep(self.settings.get("label_sep", " · "))
         if not self.settings["ime"]:
             # X11 input methods (ibus, fcitx) cost an IM-server round trip per ttk
             # widget, ~60 ms each under XWayland: seconds at start and on every tab
@@ -1608,6 +1812,7 @@ class App:
                    lambda e: (self._sync_columns(), self._schedule_marks(), self._on_select()))
         sheet.bind("<<SheetSelect>>", lambda e: (self._on_select(), self._place_handle()))
         sheet.edit_validation(self._validate_edit)
+        sheet.extra_bindings("begin_edit_cell", self._begin_edit)
         sheet.disp = {}  # data column -> fn(stored text) -> shown text, see _label_display
         raw_str = sheet.MT.cell_str
 
@@ -1866,8 +2071,7 @@ class App:
         r, c = self._dr(cur.row), cur.column
         self.v_name.set(f"{self.cols[c].name}  {r + 1}")
         self.l_stats.configure(text=col_info(self.cols[c]))
-        v = self.sheet.get_cell_data(r, c) if r < self.sheet.get_total_rows() else ""
-        self.v_fx.set("" if v is None else str(v))
+        self.v_fx.set(self.fx_text(r, c))  # a formula cell shows its formula
         self._fx_cell = (self.tab, r, self.cols[c], self.v_fx.get())
         if (r, c) in self.bad:
             self.msg(f"{self.cols[c].name}: {self.bad[r, c]}", error=True)
@@ -1917,7 +2121,7 @@ class App:
             self._fx_cell = (tab, r, col, new)
             return self.msg(f"{col.name} is read-only", error=True)
         if is_formula(new):
-            self._retry_formula(new)
+            self._retry_formula(r, self.cols.index(col))
         if col.big:
             self.tab.lk_hold = False
             col.nomatch.pop(new, None)
@@ -1935,6 +2139,12 @@ class App:
             self.sheet.set_cell_data(r, self.cols.index(col), new, redraw=True)
             self._schedule_marks()
 
+    def _begin_edit(self, event):
+        """F2, Enter or double-click on a formula cell edits the formula, as in Excel."""
+        if isinstance(event.key, str) and len(event.key) == 1:  # typing replaces the cell
+            return event.value
+        return self.fx_text(self._dr(event.row), event.column) if event.column < len(self.cols) else event.value
+
     def _validate_edit(self, event):
         """Typed cell edits must fit the column; pasted values are kept and marked
         instead (see _marks), so a big paste never loses data."""
@@ -1943,7 +2153,7 @@ class App:
             col = self.cols[c]
             value = "" if event.value is None else str(event.value)
             if is_formula(value):
-                self._retry_formula(value)
+                self._retry_formula(self._dr(event.row), c)
                 return value
             value = resolve_choice(col, value)  # label -> key
             if col.big:
@@ -2002,7 +2212,10 @@ class App:
                                ("Autofit column", self.autofit, None),
                                ("Lookup…", self.lookup_edit, None),
                                ("View lookup values…", self.lookup_view, None),
-                               ("Label display…", self.label_display_menu, None)):
+                               ("Label display…", self.label_display_menu, None),
+                               ("Add scratch column", self.scratch_add, None),
+                               ("Rename scratch column…", self.scratch_rename, None),
+                               ("Remove scratch column", self.scratch_remove, None)):
             s.popup_menu_add_command(label, fn, table_menu=False, index_menu=False,
                                      empty_space_menu=False, accelerator=acc)
         for label, fn, acc in (("Fill down", self.fill_down, "Ctrl+D"),
@@ -2026,10 +2239,167 @@ class App:
         tag = "AQFillHandle"  # runs before tksheet's own bindings so a drag can be claimed
         mt.bindtags((tag, *mt.bindtags()))
         mt.bind_class(tag, "<Motion>", self._fh_motion)
-        mt.bind_class(tag, "<ButtonPress-1>", self._fh_press)
-        mt.bind_class(tag, "<B1-Motion>", self._fh_drag)
-        mt.bind_class(tag, "<ButtonRelease-1>", self._fh_release)
+        mt.bind_class(tag, "<ButtonPress-1>", lambda e: self._pt_click(e) or self._fh_press(e))
+        mt.bind_class(tag, "<B1-Motion>", lambda e: self._pt_drag(e) or self._fh_drag(e))
+        mt.bind_class(tag, "<ButtonRelease-1>", lambda e: self._pt_release(e) or self._fh_release(e))
+        for seq in ("<Control-c>", "<Control-C>"):
+            mt.bind_class(tag, seq, lambda e: self._fx_copy())
+        for seq in ("<Control-v>", "<Control-V>"):
+            mt.bind_class(tag, seq, lambda e: self._fx_paste())
+        self._pt = None  # pointing at cells while typing a formula
+        keys = mt.text_editor_user_bound_keys
+        for arrow, d in {"<Up>": (-1, 0), "<Down>": (1, 0), "<Left>": (0, -1), "<Right>": (0, 1)}.items():
+            keys[arrow] = lambda e, d=d: self._pt_arrow(*d)
+        keys["<Key>"] = lambda e: self._pt_end()
         s.bind("<<SheetRedrawn>>", lambda e: self._place_handle())
+
+    # formulas: copy / paste ---------------------------------------------------
+    def _fx_copy(self):
+        """Ctrl+C: other programs get values; a paste here gets the formulas back."""
+        cur = self.sheet.get_currently_selected()
+        self._clip = None
+        if not cur or not self.tab.fx:
+            return
+        b = cur.box
+        found = {(r - b.from_r, c - b.from_c): (self._dr(r), c, e["f"])
+                 for r in range(b.from_r, b.upto_r) for c in range(b.from_c, min(b.upto_c, len(self.cols)))
+                 if (e := self._fx_get(self._dr(r), c))}
+        if found:
+            self.root.after_idle(lambda: setattr(self, "_clip", (self._clipboard(), found)))
+
+    def _clipboard(self) -> str:
+        try:
+            return self.root.clipboard_get()
+        except tk.TclError:
+            return ""
+
+    def _fx_paste(self):
+        clip = getattr(self, "_clip", None)
+        if not clip or clip[0] != self._clipboard():
+            return
+
+        def after():  # tksheet pasted the values; put the formulas back, moved
+            cur = self.sheet.get_currently_selected()
+            if not cur:
+                return
+            b = cur.box
+            for (dr, dc), (src_r, src_c, f) in clip[1].items():
+                r, c = b.from_r + dr, b.from_c + dc
+                if r < self._shown_rows() and c < len(self.cols) and self._writable(c):
+                    gi = self._dr(r)
+                    self.sheet.set_cell_data(gi, c, fx_shift(f, gi - src_r, c - src_c, self.cols), redraw=False)
+            self.sheet.redraw()
+            self._schedule_marks()
+            self._on_select()
+
+        self.root.after_idle(after)
+
+    # formulas: point at cells while typing one, as in Excel -------------------
+    def _pt_widget(self):
+        """The widget a formula is being typed in: the cell editor or the fx bar."""
+        te = self.sheet.MT.text_editor
+        if te.open and te.window and te.tktext.get("1.0", "end-1c").startswith("="):
+            return te.tktext
+        try:
+            if self.root.focus_get() is self.e_fx and self.v_fx.get().startswith("="):
+                return self.e_fx
+        except (KeyError, tk.TclError):
+            pass
+        return None
+
+    def _pt_ready(self, w) -> bool:
+        """At a spot where a reference fits: after =, (, comma or an operator."""
+        if self._pt and self._pt["w"] is w:
+            return True
+        if isinstance(w, tk.Text):
+            before = w.get("1.0", "insert")
+        else:
+            before = w.get()[:w.index("insert")]
+        return before.rstrip()[-1:] in tuple("=(,+-*/<>&%^|")
+
+    def _pt_ref(self, r: int, c: int, r2: int | None = None, c2: int | None = None) -> str:
+        """Reference text for displayed cell r, c (or a range to r2, c2)."""
+        gi = self._dr(r)
+        if r2 is not None and (r2, c2) != (r, c):
+            a, b = sorted((gi, self._dr(r2))), sorted((c, c2))
+            return f"{num2alpha(b[0])}{a[0] + 1}:{num2alpha(b[1])}{a[1] + 1}"
+        own = self._pt_own_row()
+        if self.settings.get("formula_refs", "names") == "names" and gi == own:
+            return fx_ref_name(self.cols[c])
+        return f"{num2alpha(c)}{gi + 1}"
+
+    def _pt_own_row(self) -> int | None:
+        te = self.sheet.MT.text_editor
+        if te.open:
+            return self._dr(te.coords[0])
+        return self._fx_cell[1] if self._fx_cell else None
+
+    def _pt_put(self, w, text: str):
+        pt = self._pt if self._pt and self._pt["w"] is w else None
+        if isinstance(w, tk.Text):
+            if pt:
+                w.delete(pt["a"], pt["b"])
+                w.mark_set("insert", pt["a"])
+            a = w.index("insert")
+            w.insert("insert", text)
+            b = w.index("insert")
+        else:
+            if pt:
+                w.delete(pt["a"], pt["b"])
+                w.icursor(pt["a"])
+            a = w.index("insert")
+            w.insert("insert", text)
+            b = w.index("insert")
+        w.focus_set()
+        return a, b
+
+    def _pt_click(self, e):
+        w = self._pt_widget()
+        if w is None or not self._pt_ready(w):
+            self._pt = None
+            return None
+        r = self.sheet.identify_row(e, allow_end=False)
+        c = self.sheet.identify_column(e, allow_end=False)
+        if r is None or c is None or c >= len(self.cols):
+            return None
+        a, b = self._pt_put(w, self._pt_ref(r, c))
+        self._pt = {"w": w, "a": a, "b": b, "r": r, "c": c, "drag": True}
+        return "break"
+
+    def _pt_drag(self, e):
+        pt = self._pt
+        if not pt or not pt.get("drag"):
+            return None
+        r = self.sheet.identify_row(e, allow_end=False)
+        c = self.sheet.identify_column(e, allow_end=False)
+        if r is not None and c is not None and c < len(self.cols):
+            a, b = self._pt_put(pt["w"], self._pt_ref(pt["r"], pt["c"], r, c))
+            pt.update(a=a, b=b)
+        return "break"
+
+    def _pt_release(self, e):
+        if self._pt and self._pt.get("drag"):
+            self._pt["drag"] = False
+            return "break"
+        return None
+
+    def _pt_arrow(self, dr: int, dc: int):
+        """Arrows right after an operator point at a cell instead of moving the caret."""
+        te = self.sheet.MT.text_editor
+        w = self._pt_widget()
+        if w is None or w is not te.tktext or not self._pt_ready(w):
+            self._pt = None
+            return None
+        r, c = (self._pt["r"], self._pt["c"]) if self._pt else te.coords
+        r = max(0, min(self._shown_rows() - 1, r + dr))
+        c = max(0, min(len(self.cols) - 1, c + dc))
+        a, b = self._pt_put(w, self._pt_ref(r, c))
+        self._pt = {"w": w, "a": a, "b": b, "r": r, "c": c, "drag": False}
+        self.sheet.see(r, c, redraw=True)
+        return "break"
+
+    def _pt_end(self):
+        self._pt = None  # typing ends pointing; the next operator starts it again
 
     def _dr(self, r: int) -> int:  # displayed row -> data row (differs while filtered)
         return self.sheet.displayed_row_to_data(r)
@@ -2156,16 +2526,24 @@ class App:
             for c in range(c0, c1):
                 if not self._writable(c):
                     continue
-                src = [self._cell(r, c) for r in range(r0, r1)]
-                vals = ([src[i % len(src)] for i in range(end_r - r1)] if copy
-                        else excel_ops.fill_series(src, end_r - r1))
+                src = [self.fx_text(self._dr(r), c) for r in range(r0, r1)]
+                if any(is_formula(v) for v in src):  # formulas copy, their references move down
+                    vals = [fx_shift(src[i % len(src)], r1 + i - (r0 + i % len(src)), 0, self.cols)
+                            for i in range(end_r - r1)]
+                else:
+                    vals = ([src[i % len(src)] for i in range(end_r - r1)] if copy
+                            else excel_ops.fill_series(src, end_r - r1))
                 for i, v in enumerate(vals):
                     writes[(r1 + i, c)] = v
         elif end_c is not None:
             for r in range(r0, r1):
-                src = [self._cell(r, c) for c in range(c0, c1)]
-                vals = ([src[i % len(src)] for i in range(end_c - c1)] if copy
-                        else excel_ops.fill_series(src, end_c - c1))
+                src = [self.fx_text(self._dr(r), c) for c in range(c0, c1)]
+                if any(is_formula(v) for v in src):
+                    vals = [fx_shift(src[i % len(src)], 0, c1 + i - (c0 + i % len(src)), self.cols)
+                            for i in range(end_c - c1)]
+                else:
+                    vals = ([src[i % len(src)] for i in range(end_c - c1)] if copy
+                            else excel_ops.fill_series(src, end_c - c1))
                 for i, v in enumerate(vals):
                     if self._writable(c1 + i):
                         writes[(r, c1 + i)] = v
@@ -2767,19 +3145,31 @@ class App:
 
         return out, [widen(r) + r[n:] for r in data], {k: widen(o) for k, o in orig.items()}
 
-    def _relabel(self):
-        """Rebuild label columns after a display or lookup change; edits stay."""
+    def _relabel(self, add: tuple[int, "Col"] | None = None, drop: "Col | None" = None):
+        """Rebuild the columns after a display or lookup change, or to add (before
+        index) / drop a scratch column; edits and formulas stay."""
         if not self.cols:
             return
         n = len(self.cols)
         rows = self._rows()
-        keep = [i for i, c in enumerate(self.cols) if c.of is None]
-        cols = [self.cols[i] for i in keep]
-        data = [[r[i] for i in keep] + [r[n]] for r in rows]
-        orig = {k: [o[i] for i in keep] for k, o in self.orig.items()}
+        keep = [i for i, c in enumerate(self.cols) if c.of is None and c is not drop]
+        if add:
+            at_col = next((k for k, i in enumerate(keep) if i >= add[0]), len(keep))
+            keep.insert(at_col, None)  # None: the new column, empty
+        cols = [self.cols[i] if i is not None else add[1] for i in keep]
+        data = [[r[i] if i is not None else "" for i in keep] + [r[n]] for r in rows]
+        orig = {k: [o[i] if i is not None else "" for i in keep] for k, o in self.orig.items()}
+        old_data, old_cols = self.sheet.MT.data, list(self.cols)
+        formulas = [(gi, old_cols[ci], e) for gi, row in enumerate(old_data)
+                    for hit in [self.tab.fx.get(id(row))] if hit and hit[0] is row for ci, e in hit[1].items()]
         cur = self.sheet.get_currently_selected()
         at = (cur.row, self.cols[cur.column], cur.type_) if cur and cur.column < n else None
         self._show(cols, data, orig)
+        self.tab.fx = {}
+        for gi, col, e in formulas:  # same rows, new row lists: move the formulas over
+            if col in self.cols and gi < len(self.sheet.MT.data):
+                row = self.sheet.MT.data[gi]
+                self.tab.fx.setdefault(id(row), (row, {}))[1][self.cols.index(col)] = e
         if at and at[1] in self.cols:  # same cell / column stays selected
             c = self.cols.index(at[1])
             if at[2] == "columns":
@@ -2903,6 +3293,64 @@ class App:
             lookups[key] = pick
         save_settings(self.settings)
 
+    def scratch_add(self):
+        """A column of your own right of the selected one: type notes, work things out
+        with formulas. Kept on this sheet; Insert / Update never send it."""
+        i = self._col()
+        if i is None:
+            return self.msg("Load a table or run a query first", error=True)
+        taken = {c.label.lower() for c in self.cols}
+        k = 1
+        while f"scratch{k}" in taken:
+            k += 1
+        name = simpledialog.askstring("Add scratch column", "Name of the new column\n"
+                                      "(on this sheet only, never written to the database):",
+                                      initialvalue=f"Scratch{k}", parent=self.root)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        if name.lower() in taken:
+            return self.msg(f"There is already a column {name}", error=True)
+        col = Col(name, "", False, False, False, external=True)
+        col.scratch, col.readonly = True, False
+        self._relabel(add=(i + 1, col))
+        c = self.cols.index(col)
+        self.sheet.select_column(c)
+        self.sheet.see(0, c)
+        self.msg(f"{name}: scratch column, kept on this sheet only and never written")
+
+    def _scratch_col(self) -> "Col | None":
+        i = self._col()
+        if i is None or not self.cols[i].scratch:
+            self.msg("Select a scratch column first", error=True)
+            return None
+        return self.cols[i]
+
+    def scratch_rename(self):
+        col = self._scratch_col()
+        if col is None:
+            return
+        name = simpledialog.askstring("Rename scratch column", "New name:", initialvalue=col.label,
+                                      parent=self.root)
+        if not name or not name.strip() or name.strip() == col.label:
+            return
+        if name.strip().lower() in {c.label.lower() for c in self.cols if c is not col}:
+            return self.msg(f"There is already a column {name.strip()}", error=True)
+        col.name = col.label = name.strip()
+        self._relabel()
+
+    def scratch_remove(self):
+        col = self._scratch_col()
+        if col is None:
+            return
+        filled = sum(1 for r in self._rows() if r[self.cols.index(col)].strip())
+        if filled and not messagebox.askyesno("Remove scratch column",
+                                              f"{col.label} has {filled:,} filled cells. Remove it?",
+                                              parent=self.root):
+            return
+        self._relabel(drop=col)
+        self.msg(f"{col.label} removed")
+
     def find_column(self):
         """Ctrl+Shift+F: jump to a column by (part of) its name."""
         if self.cols:
@@ -3012,10 +3460,11 @@ class App:
             if rid and rid in self.orig:
                 o = self.orig[rid]
                 ch = [i for i in range(n)
-                      if nz(vals[i]) != nz(o[i]) and not self.cols[i].readonly and i not in mirrors]
+                      if nz(vals[i]) != nz(o[i]) and not self.cols[i].readonly and i not in mirrors
+                      and not self.cols[i].scratch]
                 if ch:
                     edited.append((gi, rid, ch))
-            elif any(nz(v.strip()) is not None for v in vals):
+            elif any(nz(v.strip()) is not None for v, c in zip(vals, self.cols) if not c.scratch):
                 new.append((gi, vals))
         return new, edited
 
@@ -3053,7 +3502,9 @@ class App:
         twin_of = {g[0]: g[1:] for g in self._twins()}
         cells = [(gi, x) for gi, _, ch in edited for ci in ch for x in [ci, *twin_of.get(ci, [])]]
         for i, c in enumerate(self.cols):  # keys and lookups stand out in the header
-            if c.is_pk and not c.external:
+            if c.scratch:
+                self.sheet.highlight_cells(row=0, column=i, canvas="header", bg=C["new"], redraw=False)
+            elif c.is_pk and not c.external:
                 self.sheet.highlight_cells(row=0, column=i, canvas="header", fg=C["accent"], redraw=False)
             elif c.choices is not None or c.big or c.fk:
                 self.sheet.highlight_cells(row=0, column=i, canvas="header", fg=C["link"], redraw=False)
@@ -3072,7 +3523,7 @@ class App:
         if bad:
             self.sheet.highlight_cells(cells=list(bad), bg=C["old"], fg=C["error"], redraw=False)
         self.sheet.redraw()
-        writable = bool(self.table) and any(not c.readonly for c in self.cols)
+        writable = bool(self.table) and any(not c.readonly and not c.scratch for c in self.cols)
         bad_rows = {r for r, _ in bad}
         for b, items, word in ((self.b_insert, new, "Insert"), (self.b_update, edited, "Update")):
             n = len(items)
@@ -3092,75 +3543,186 @@ class App:
         self.l_status.configure(text="  ·  ".join(p for p in parts if p))
         self._top_up(rows)
 
-    def _formula_cells(self, rows, new, edited) -> dict[str, list[tuple[int, int]]]:
-        """Formula -> its cells, among entered values (loaded data is never evaluated).
-        Errors are kept per formula and column type: 'formula\ttype'."""
-        t, out = self.tab, {}
-        ok = {ci for ci, col in enumerate(self.cols) if not (col.external or col.readonly or col.audit)}
-        cells = [(gi, ci) for gi, _ in new for ci in ok]
-        cells += [(gi, ci) for gi, _, ch in edited for ci in ch if ci in ok]
-        for gi, ci in cells:
-            v = rows[gi][ci]
-            if is_formula(v) and v not in t.fx_out:
-                out.setdefault(f"{v}\t{sql_type(self.cols[ci])}", []).append((gi, ci))
-        return out
+    # live formulas ----------------------------------------------------------
+    # A cell holds its result (what Insert / Update write); its formula lives in
+    # tab.fx, keyed by the row's list object so sort / filter / new rows keep it.
+    def _fx_get(self, gi: int, ci: int) -> dict | None:
+        data = self.sheet.MT.data
+        if gi >= len(data):
+            return None
+        hit = self.tab.fx.get(id(data[gi]))
+        return hit[1].get(ci) if hit and hit[0] is data[gi] else None
 
-    def _retry_formula(self, expr: str):
-        """Typed again: evaluate it again (the error may have been fixed on the server)."""
-        t = self.tab
-        t.fx_err = {k: v for k, v in t.fx_err.items() if k.split("\t")[0] != expr}
-        t.fx_hold = False
+    def fx_text(self, gi: int, ci: int) -> str:
+        """What a cell is: its formula, else its value (fx bar, editor, fill, copy)."""
+        e = self._fx_get(gi, ci)
+        if e:
+            return e["f"]
+        v = self.sheet.get_cell_data(gi, ci) if gi < self.sheet.get_total_rows() else ""
+        return "" if v is None else str(v)
+
+    def _retry_formula(self, gi: int, ci: int):
+        """Entered again: evaluate again (the error may have been fixed on the server)."""
+        e = self._fx_get(gi, ci)
+        if e:
+            e["err"] = e["sig"] = None
+        self.tab.fx_hold = False
 
     def _formulas(self, rows, new, edited):
-        """Evaluate entered formulas (=GETDATE(), =NEWID(), =UPPER('x'), =(SELECT …))
-        on the server as read-only SELECTs, and put the results in their cells."""
-        t = self.tab
-        todo = {e: c for e, c in self._formula_cells(rows, new, edited).items() if e not in t.fx_err}
-        if not todo or self._busy or t.fx_hold or t.db.cn is None:
+        """Keep formulas in step with the grid and evaluate those that need it.
+        Typed, pasted and filled "=…" cells become formulas (loaded data never does);
+        a value typed over a formula ends it. A formula is evaluated when it is new or
+        a cell it reads changed; one that reads a formula waits for that one first.
+        Cells sharing a shape (a filled-down formula) go to the server as one query."""
+        t, data, n = self.tab, self.sheet.MT.data, len(self.cols)
+        pos = {id(r): gi for gi, r in enumerate(data)}
+        for k in [k for k, (row, _) in t.fx.items() if pos.get(k) is None or data[pos[k]] is not row]:
+            del t.fx[k]  # row deleted, or the grid reloaded
+        ok = {ci for ci, c in enumerate(self.cols) if not (c.external or c.readonly or c.audit)}
+        entered = [(gi, ci) for gi, _ in new for ci in ok] + [(gi, ci) for gi, _, ch in edited for ci in ch if ci in ok]
+        local = [ci for ci, c in enumerate(self.cols) if c.scratch]
+        entered += [(gi, ci) for ci in local for gi, r in enumerate(rows) if is_formula(r[ci])]
+        for gi, ci in entered:
+            v = rows[gi][ci]
+            if is_formula(v):
+                cells = t.fx.setdefault(id(data[gi]), (data[gi], {}))[1]
+                e = cells.get(ci)
+                if e is None or (v != e["f"] and v != e["res"]):
+                    cells[ci] = {"f": v, "res": None, "sig": None, "err": None}
+        fcells: dict[tuple[int, int], dict] = {}
+        for k, (row, cells) in list(t.fx.items()):
+            gi = pos[k]
+            for ci, e in list(cells.items()):
+                cur = rows[gi][ci] if ci < n else ""
+                if cur == e["f"] or (e["res"] is not None and cur == e["res"]):
+                    fcells[gi, ci] = e
+                else:  # a value typed or pasted over it
+                    del cells[ci]
+            if not cells:
+                del t.fx[k]
+        t.fx_why = {}
+        if not fcells:
             return
-        db, database = self.db, self.database
+        # what each formula needs, in dependency order (iterative: fill-down chains are long)
+        status: dict[tuple[int, int], str] = {}  # ok / eval / wait / err
+        plan: dict[str, list] = {}
+        for start in fcells:
+            if start in status:
+                continue
+            stack, onpath = [(start, None)], set()
+            while stack:
+                cell, info = stack[-1]
+                if info is None:
+                    onpath.add(cell)
+                    e = fcells[cell]
+                    try:
+                        info = fx_parse(e["f"], cell[0], self.cols, len(rows))
+                    except FxError as x:
+                        info = x
+                    deps = [] if isinstance(info, FxError) else \
+                        [d for r in info[1] for d in ([(r[2], r[1])] if r[0] == "cell" else r[2]) if d in fcells]
+                    stack[-1] = (cell, (info, deps))
+                    nxt = next((d for d in deps if d not in status and d not in onpath), None)
+                    if nxt is not None:
+                        stack.append((nxt, None))
+                        continue
+                else:
+                    info, deps = info
+                    nxt = next((d for d in deps if d not in status and d not in onpath), None)
+                    if nxt is not None:
+                        stack.append((nxt, None))
+                        continue
+                stack.pop()
+                onpath.discard(cell)
+                status[cell] = self._fx_status(cell, fcells[cell], info, deps, status, rows, plan)
+        if plan and not self._busy and not t.fx_hold and t.db.cn is not None:
+            self._fx_run(plan)
+
+    def _fx_status(self, cell, e, info, deps, status, rows, plan) -> str:
+        t = self.tab
+        gi, ci = cell
+        if isinstance(info, FxError):
+            t.fx_why[cell] = f"Formula: {info}"
+            return "err"
+        if any(d == cell or status.get(d) is None for d in deps):  # still on the path: a loop
+            t.fx_why[cell] = "Formula: circular reference"
+            return "err"
+        bad = next((d for d in deps if status[d] == "err"), None)
+        if bad is not None:
+            t.fx_why[cell] = f"Formula: {num2alpha(bad[1])}{bad[0] + 1} has an error"
+            return "err"
+        if any(status[d] in ("eval", "wait") for d in deps):
+            t.fx_why[cell] = "Formula: waiting for the cells it reads"
+            return "wait"
+        pieces, refs, shape = info
+
+        def val(r, c):
+            v = rows[r][c]
+            return None if v == "" or v.strip().upper() == "NULL" else v
+
+        values = [val(r[2], r[1]) if r[0] == "cell" else [val(rr, cc) for rr, cc in r[2]] for r in refs]
+        sig = (e["f"], json.dumps(values))
+        cur = rows[gi][ci]
+        if e["err"] and e["sig"] == sig:
+            t.fx_why[cell] = f"Formula failed: {e['err']}"
+            return "err"
+        if cur == e["f"] or e["sig"] != sig:
+            col = self.cols[ci]
+            key = f"{shape}\t{sql_type(col)}"
+            if key not in plan:
+                plan[key] = [fx_sql(pieces, refs, self.cols, sql_type(col)), []]
+            item = {"i": len(plan[key][1])}
+            item.update({f"p{k}": v for k, v in enumerate(values)})
+            plan[key][1].append((item, self.sheet.MT.data[gi], ci, sig, cur))
+            t.fx_why[cell] = ("Formula: connect to evaluate it" if t.db.cn is None else
+                              "Formula: not evaluated, enter it again" if t.fx_hold and not self._busy
+                              else "Formula: calculating …")
+            return "eval"
+        return "ok"
+
+    def _fx_run(self, plan: dict):
+        t, db, database = self.tab, self.db, self.database
+        jobs = []
+        for key, (sql, cells) in plan.items():
+            err = check_select(sql)
+            jobs.append((sql, cells, err))
         t.fx_hold = True  # stays set if cancelled, so Cancel is not undone by the next redraw
 
         def work():
-            res = {}
-            for key, cells in todo.items():
-                expr, cast = key.split("\t")
-                sql = formula_sql(expr[1:], len(cells), cast)
-                err = check_select(sql)
-                if err:
-                    res[key] = RuntimeError(err)
-                    continue
-                try:
-                    vals = [r[0] for r in db._read(database, sql, top=len(cells))[1]]
-                    res[key] = vals + vals[-1:] * (len(cells) - len(vals)) if vals else [""] * len(cells)
-                except Exception as e:  # noqa: BLE001 - shown on the cell
-                    if db.cancelled:
-                        raise
-                    res[key] = e
-            return res
+            return [(cells, RuntimeError(err)) if err else (cells, db.eval_fx(database, sql, [c[0] for c in cells]))
+                    for sql, cells, err in jobs]
 
         def done(res, secs):
             t.fx_hold = False
-            now = self._rows()
-            failed, n = [], 0
-            for key, out in res.items():
-                expr = key.split("\t")[0]
-                if isinstance(out, Exception):
-                    t.fx_err[key] = clean_err(out)
-                    failed.append(f"{expr}: {t.fx_err[key]}")
-                    continue
-                for (gi, ci), v in zip(todo[key], out):
-                    if gi < len(now) and now[gi][ci] == expr:  # not changed meanwhile
-                        t.fx_out.add(v)
+            data = self.sheet.MT.data
+            pos = {id(r): gi for gi, r in enumerate(data)}
+            n_ok, failed = 0, []
+            for cells, out in res:
+                for item, row, ci, sig, cur in cells:
+                    gi = pos.get(id(row))
+                    e = self._fx_get(gi, ci) if gi is not None else None
+                    if e is None or data[gi][ci] != cur or e["f"] != sig[0]:
+                        continue  # changed while the server worked: the next round redoes it
+                    v = out if isinstance(out, Exception) else out.get(item["i"])
+                    e["sig"] = sig
+                    if isinstance(v, Exception):
+                        e["err"] = clean_err(v)
+                        failed.append(f"{num2alpha(ci)}{gi + 1} {e['f']}: {e['err']}")
+                        continue
+                    v = "" if v is None else v
+                    e["err"], e["res"] = None, v
+                    if data[gi][ci] != v:
                         self.sheet.set_cell_data(gi, ci, v, redraw=False)
-                        n += 1
+                    n_ok += 1
             if failed:
-                self.msg("Formula failed: " + "\n".join(failed), error=True)
+                more = f"\n… and {len(failed) - 5:,} more" if len(failed) > 5 else ""
+                self.msg("Formula failed: " + "\n".join(failed[:5]) + more, error=True)
             else:
-                self.msg(f"{n:,} formula cell{'s' * (n != 1)} evaluated ({secs:.1f}s)")
+                self.msg(f"{n_ok:,} formula cell{'s' * (n_ok != 1)} calculated ({secs:.1f}s)")
             self.sheet.redraw()
+            self._on_select()
 
-        self.bg("Evaluating formulas", work, done, cancel=True)
+        self.bg("Calculating formulas", work, done, cancel=True)
 
     def _big_lookups(self, rows, new, edited):
         """Big lookups (too many rows to list): read the label fields of the values in
@@ -3255,13 +3817,7 @@ class App:
             if col.big and col.of is None and v and v.strip().upper() != "NULL" and not is_formula(v) \
                     and col.in_lookup(v) is None and v not in col.nomatch:
                 bad[gi, ci] = "Checking the lookup …"
-        for key, cells in self._formula_cells(rows, new, edited).items():
-            err = self.tab.fx_err.get(key)
-            why = (f"Formula failed: {err}" if err else "Formula: connect to evaluate it" if not self.db.cn
-                   else "Formula: not evaluated, enter it again" if self.tab.fx_hold and not self._busy
-                   else "Formula: waiting to be evaluated")
-            for cell in cells:
-                bad[cell] = why
+        bad.update(self.tab.fx_why)  # formulas not calculated yet, or failed
         return bad
 
     def _spare(self, row: list[str]) -> bool:
@@ -4192,9 +4748,8 @@ class SettingsDialog(tk.Toplevel):
                   style="Group.TLabel", justify="left").grid(row=4, column=0, columnspan=2,
                                                             sticky="w", pady=(2, 12))
         ttk.Label(f, text="Lookup labels", style="Group.TLabel").grid(row=8, column=0, columnspan=2, sticky="w")
-        for r, (text, key, options) in enumerate((("Show", "label_display", LABEL_MODES),
-                                                  ("Format", "label_format", LABEL_FORMATS),
-                                                  ("Not in lookup", "mismatch", MISMATCH)), start=9):
+        for r, (text, key, options) in ((9, ("Show", "label_display", LABEL_MODES)),
+                                        (12, ("Not in lookup", "mismatch", MISMATCH))):
             ttk.Label(f, text=text).grid(row=r, column=0, sticky="w", padx=(0, 12), pady=3)
             names = {v: k for k, v in options.items()}
             var = tk.StringVar(value=names.get(app.settings.get(key), next(iter(options))))
@@ -4202,9 +4757,28 @@ class SettingsDialog(tk.Toplevel):
             cb.grid(row=r, column=1, sticky="w", pady=3)
             cb.bind("<<ComboboxSelected>>",
                     lambda e, key=key, var=var, options=options: self._label_pref(app, key, options[var.get()]))
-        ttk.Label(f, text="Display only: the database always gets the id. Per column: header menu ->\n"
-                         "Label display…", style="Group.TLabel", justify="left"
-                  ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(2, 12))
+        # format and separator: pick one or type your own
+        for r, (text, key, values, default) in enumerate((
+                ("Format", "label_format", list(LABEL_FORMATS.values()) + ["{label} - {id}", "{id} | {label}"],
+                 "{id} · {label}"),
+                ("Field separator", "label_sep", LABEL_SEPS, " · ")), start=10):
+            ttk.Label(f, text=text).grid(row=r, column=0, sticky="w", padx=(0, 12), pady=3)
+            var = tk.StringVar(value=app.settings.get(key, default))
+            cb = ttk.Combobox(f, textvariable=var, values=values, width=22)
+            cb.grid(row=r, column=1, sticky="w", pady=3)
+            for ev in ("<<ComboboxSelected>>", "<Return>", "<FocusOut>"):
+                cb.bind(ev, lambda e, key=key, var=var: self._label_text(app, key, var))
+        ttk.Label(f, text="Format: type your own with {id} and {label}, e.g. {label} ({id}) or {id} - {label}.\n"
+                         "Separator: between several shown fields. Display only: the database always\n"
+                         "gets the id. Per column: header menu -> Label display…", style="Group.TLabel",
+                  justify="left").grid(row=13, column=0, columnspan=2, sticky="w", pady=(2, 12))
+        ttk.Label(f, text="Formula references").grid(row=7, column=0, sticky="w", padx=(0, 12), pady=(0, 12))
+        refs = {"Column names (ISIN)": "names", "Cells (B2)": "cells"}
+        v_refs = tk.StringVar(value={v: k for k, v in refs.items()}[app.settings.get("formula_refs", "names")])
+        cb = ttk.Combobox(f, textvariable=v_refs, values=list(refs), width=22, state="readonly")
+        cb.grid(row=7, column=1, sticky="w", pady=(0, 12))
+        cb.bind("<<ComboboxSelected>>", lambda e: (app.settings.__setitem__("formula_refs", refs[v_refs.get()]),
+                                                   save_settings(app.settings)))
         self.v_ime = tk.BooleanVar(value=app.settings.get("ime", False))
         ttk.Checkbutton(f, text="Input method (IME) for composed characters, applies on restart",
                         variable=self.v_ime, command=lambda: self._ime(app)
@@ -4214,10 +4788,26 @@ class SettingsDialog(tk.Toplevel):
                                     save_settings(app.settings),
                                     app.msg("Lookups reset to automatic; applies on the next Load"))
                    ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 12))
-        ttk.Label(f, text=f"Version {VERSION}", style="Group.TLabel").grid(row=13, column=0, sticky="w")
-        ttk.Button(f, text="Close", command=self.destroy).grid(row=13, column=1, sticky="e")
+        ttk.Label(f, text=f"Version {VERSION}", style="Group.TLabel").grid(row=14, column=0, sticky="w")
+        ttk.Button(f, text="Close", command=self.destroy).grid(row=14, column=1, sticky="e")
         self.bind("<Escape>", lambda e: self.destroy())
         modal(self)
+
+    def _label_text(self, app: "App", key: str, var: tk.StringVar):
+        """A typed format / separator: checked, then applied to every open sheet."""
+        value = var.get()
+        if key == "label_format":
+            err = label_format_error(value)
+            if err:
+                return app.msg(err, error=True)
+        elif not value:
+            return
+        if app.settings.get(key) == value:
+            return
+        if key == "label_sep":
+            set_label_sep(value)
+        self._label_pref(app, key, value)
+        app.msg(f"Lookup labels now show as {app._label_fmt('same').format(id='6', label='Valoren' + LABEL_SEP + 'CH')}")
 
     def _label_pref(self, app: "App", key: str, value: str):
         app.settings[key] = value
