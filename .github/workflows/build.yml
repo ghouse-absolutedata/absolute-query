@@ -65,9 +65,14 @@ jobs:
         run: |
           cp windows/build_id.txt AbsoluteQuery.exe.build
           cp linux/build_id.txt AbsoluteQuery-linux.build
-          gh release delete build --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
-          gh release create build --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
-            --title "AbsoluteQuery" \
-            --notes "Latest build, from commit $GITHUB_SHA. Download AbsoluteQuery.exe (Windows) or AbsoluteQuery-linux (Linux). Installed copies update themselves." \
-            windows/AbsoluteQuery.exe linux/AbsoluteQuery-linux \
-            AbsoluteQuery.exe.build AbsoluteQuery-linux.build
+          files="windows/AbsoluteQuery.exe linux/AbsoluteQuery-linux AbsoluteQuery.exe.build AbsoluteQuery-linux.build"
+          notes="Latest build, from commit $GITHUB_SHA. Download AbsoluteQuery.exe (Windows) or AbsoluteQuery-linux (Linux). Installed copies update themselves."
+          if gh release view build --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # replace files in place: the download links never go missing
+            gh release upload build $files --clobber --repo "$GITHUB_REPOSITORY"
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/build" -f sha="$GITHUB_SHA" -F force=true
+            gh release edit build --notes "$notes" --latest --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create build $files --target "$GITHUB_SHA" --latest --title "AbsoluteQuery" \
+              --notes "$notes" --repo "$GITHUB_REPOSITORY"
+          fi
