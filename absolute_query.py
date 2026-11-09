@@ -47,9 +47,12 @@ Types, keys and lookups
   referenced column (when it has at most 5000 values). A foreign key dropdown
   shows a text column of the referenced table beside the key ("3  ·  ISIN"),
   the cell keeps the key. The column is picked automatically (*Name, then
-  *Description, then *Code); right-click the header -> Lookup label… to pick
-  another, show the key only, or turn the dropdown off (remembered per
-  referenced table; Settings forgets). Typing a label (or part of it) finds
+  *Description, then *Code). Right-click a header -> Lookup… to set any
+  column's lookup yourself: a table (database.schema.table allowed), its key
+  column and the column shown beside it; or no dropdown; or automatic again.
+  Remembered per column (Settings resets all). Header -> View lookup values…
+  lists every id with its label, searchable; Use writes the id into the
+  selected cells. Typing a label (or part of it) finds
   the entry; Enter stores its key ("valoren" -> 6), in the cell or the fx bar. Lookup file, JSON (a two-column SELECT
   shows its second column the same way):
       {"Sales.dbo.Orders.Status": ["Open", "Shipped", "Closed"],
@@ -86,6 +89,9 @@ Sheets: tabs at the bottom, each with its own connection, database, table / quer
   Ctrl+PgUp / Ctrl+PgDn switch. Open sheets are restored on start (source and
   query, not unsaved grid edits); closing with unsaved edits asks first.
 
+Messages: errors (including trigger errors and server PRINT output) show in the
+bottom bar; click it for the full text of recent messages.
+
 Empty cell or NULL = SQL NULL. Identity, computed and timestamp columns are read-only.
 """
 from __future__ import annotations
@@ -100,6 +106,7 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import tkinter as tk
 from decimal import Decimal
@@ -157,7 +164,8 @@ SETTINGS_FILE = Path.home() / ".absolutequery.json"
 
 
 def load_settings() -> dict:
-    s = {"theme": "Light", "review": True, "lookup_file": "", "ime": False}
+    s = {"theme": "Light", "review": True, "lookup_file": "", "ime": False,
+         "label_display": "same", "label_format": "{id} · {label}", "mismatch": "both"}
     try:
         s.update(json.loads(SETTINGS_FILE.read_text()))
     except (OSError, ValueError):
@@ -258,10 +266,25 @@ class Col:
         self.choices: frozenset[str] | None = None  # allowed values; None = anything of the type
         self.choice_list: list[str] = []  # dropdown entries: "key" or "key  ·  label"
         self.picked: dict[str, str] = {}  # dropdown entry -> key, for entries with a label
-        self.key_label: dict[str, str] = {}
-        self.ref_name = ""  # "database.schema.table" the foreign key points at
-        self.label_options: list[str] = []  # its text columns, to show beside the key
-        self.label_col = ""  # the one shown
+        self.key_label: dict[str, str] = {}  # key -> its label fields joined: "Bond · Fixed income"
+        self.label_fields: list[str] = []  # names of the fields shown beside the key
+        self.key_fields: dict[str, tuple[str, ...]] = {}  # key -> each label field's value
+        # table lookup in use (foreign key or set from the header menu):
+        # {"db", "table" (schema.table), "key", "label" (field, list of fields, "" = key only)}
+        self.src: dict | None = None
+        self.of: Col | None = None  # set on a label column: the lookup column it describes
+        self.part: int | None = None  # label column of one field: its index in of.label_fields
+        # a lookup too big to list (over MAX_CHOICES rows): the server is asked per value.
+        # key_fields / key_label then hold the values found so far, `missing` those not in it,
+        # `nomatch` typed text that named no single row (-> why)
+        self.big = False
+        self.key_type = ""  # the lookup key's SQL type, for TRY_CONVERT
+        self.missing: set[str] = set()
+        self.nomatch: dict[str, str] = {}
+        self.search_fields: list[str] = []
+        self.subs: dict[int, Col] = {}  # label field index -> its own lookup ("Col ▸ Field")
+        self.fmt = ""  # shown text of a sub lookup's value, "" = the raw value (set by App)
+
         self.label = name  # grid header; a query alias when it differs from the column name
         self.external = external  # query column not in the target table: shown, never written
         self.readonly = bool(external or is_identity or is_computed
@@ -270,6 +293,17 @@ class Col:
         low = name.lower()
         self.audit = ("cdate" if low in CREATED_DATE else "cby" if low in CREATED_BY else
                       "mdate" if low in MODIFIED_DATE else "mby" if low in MODIFIED_BY else None)
+
+    def in_lookup(self, v: str) -> bool | None:
+        """Is `v` an allowed value? None: not known (no lookup, or not asked yet)."""
+        if self.big:
+            return True if v in self.key_fields else False if v in self.missing else None
+        return None if self.choices is None else v in self.choices
+
+    @property
+    def labelled(self) -> bool:
+        """Has label fields to show beside its values."""
+        return bool(self.key_label) or (self.big and bool(self.label_fields))
 
 
 class RowError(Exception):
@@ -284,6 +318,7 @@ class Db:
         self.args = None
         self.active: pyodbc.Cursor | None = None  # running statement, for cancel()
         self.fetched = 0  # rows read so far by the running statement, for progress
+        self.notes: list[str] = []  # server messages of the last read / write (PRINT, triggers)
         self.cancelled = False
 
     def connect(self, server, uid, pwd):
@@ -310,18 +345,22 @@ class Db:
         """Cursor in `database`. Reads run READ UNCOMMITTED - the same as NOLOCK on
         every table - so they never wait on or block other sessions; writes run
         READ COMMITTED."""
+        if self.cancelled:  # the job was cancelled: run nothing more of it
+            raise RuntimeError("Cancelled")
         if self.cn is None:
             raise RuntimeError("Not connected")
         setup = ((f"USE {q(database)}; " if database else "") + "SET TRANSACTION ISOLATION LEVEL "
                  f"{'READ COMMITTED' if write else 'READ UNCOMMITTED'};")
         try:
-            c = self.cn.cursor()
+            c = self.active = self.cn.cursor()  # any statement can be cancelled
             c.execute(setup)
             return c
         except pyodbc.Error as e:
+            if self.cancelled:
+                raise RuntimeError("Cancelled") from None
             if "08S01" in str(e) or "08003" in str(e):  # dropped link: reconnect once
                 self.connect(*self.args)
-                c = self.cn.cursor()
+                c = self.active = self.cn.cursor()
                 c.execute(setup)
                 return c
             raise
@@ -330,9 +369,10 @@ class Db:
         """One read in its own transaction, committed. Rows arrive in chunks so
         self.fetched shows progress and cancel() can stop it between chunks."""
         c = self.cur(database)
-        self.active, self.fetched, self.cancelled = c, 0, False
+        self.active, self.fetched, self.notes = c, 0, []
         try:
             c.execute(sql, *params)
+            self.notes += server_notes(c)
             while c.description is None and c.nextset():
                 pass
             if c.description is None:
@@ -340,6 +380,8 @@ class Db:
             names = [d[0] or f"col{i + 1}" for i, d in enumerate(c.description)]
             rows: list[list[str]] = []
             while top is None or len(rows) < top:
+                if self.cancelled:
+                    raise RuntimeError("Cancelled")
                 chunk = c.fetchmany(5000 if top is None else min(5000, top - len(rows)))
                 if not chunk:
                     break
@@ -349,22 +391,33 @@ class Db:
             self.cn.commit()
             return names, rows
         except Exception:
-            self.cn.rollback()
+            try:
+                self.cn.rollback()
+            except pyodbc.Error:
+                pass
             if self.cancelled:  # the driver reports a cancel in several ways
                 raise RuntimeError("Cancelled") from None
             raise
         finally:
             self.active = None
 
+    def begin(self):
+        """A new job starts: earlier cancels no longer apply."""
+        self.cancelled = False
+
     def cancel(self):
-        """Stop the running statement (called from the UI thread)."""
+        """Stop the running job (UI thread): its current statement gets a
+        cancel request and no further statement of it runs. The request goes
+        from a helper thread, as a dead network can block it too."""
+        self.cancelled = True
         c = self.active
         if c is not None:
-            self.cancelled = True
-            try:
-                c.cancel()
-            except pyodbc.Error:
-                pass
+            def send():
+                try:
+                    c.cancel()
+                except pyodbc.Error:
+                    pass
+            threading.Thread(target=send, daemon=True).start()
 
     def databases(self) -> list[str]:
         c = self.cur("master")
@@ -428,15 +481,28 @@ class Db:
                 by_name[col_name].fk = ref
         return cols
 
-    def lookups(self, database: str, table: str, cols: list[Col], spec: dict, labels: dict) -> None:
-        """Fill col.choices from the lookup file (`spec`, see lookup_for) or, failing
-        that, from the referenced column of a foreign key. A foreign key's dropdown
-        shows a text column of the referenced table beside the key: the one chosen
-        from the header menu (`labels`, "db.schema.table" -> column, "" = key only,
-        NO_LOOKUP = no dropdown), else the likeliest (see guess_label)."""
-        jobs = []
+    def lookups(self, database: str, table: str, cols: list[Col], spec: dict, prefs: dict) -> None:
+        """Fill each column's allowed values, first match wins:
+        1. the lookup set from the header menu (prefs["lookups"], see col_key),
+        2. the lookup file (`spec`, see lookup_for),
+        3. the foreign key's referenced table.
+        A table lookup shows a text column beside the key: the one chosen, else
+        the likeliest (guess_label)."""
+        overrides, fk_labels = prefs.get("lookups", {}), prefs.get("fk_labels", {})
+        jobs, tables = [], []
         for col in cols:
+            col.choices, col.choice_list, col.picked, col.key_label, col.src = None, [], {}, {}, None
+            col.label_fields, col.key_fields = [], {}
+            col.big, col.key_type, col.missing, col.nomatch = False, "", set(), {}
+            col.lookup = ""
             if col.external or col.readonly:
+                continue
+            over = overrides.get(col_key(database, table, col.name))
+            if over:
+                if not over.get("off"):
+                    tables.append((col, {k: over.get(k) for k in ("db", "table", "key", "label")},
+                                   (f"{over['db']}." if (over.get("db") or database).lower() != database.lower()
+                                    else "") + f"{over['table']}.{over['key']} (set by you)"))
                 continue
             entry = lookup_for(spec, database, table, col.name)
             if isinstance(entry, list):
@@ -445,28 +511,152 @@ class Db:
                 jobs.append((col, entry.get("database") or database, entry["sql"], "lookup file"))
             elif col.fk:
                 ref_schema, ref_table, ref_col = col.fk.split(".")
-                rows = self._read(database, "SELECT SUM(rows) FROM sys.partitions WHERE object_id = OBJECT_ID(?) "
-                                            "AND index_id IN (0, 1)", (f"{q(ref_schema)}.{q(ref_table)}",))[1]
-                if rows and rows[0][0] and int(rows[0][0]) > MAX_CHOICES:  # too big to list
-                    continue
-                col.ref_name = f"{database}.{ref_schema}.{ref_table}"
-                label = labels.get(col.ref_name)
-                col.label_options = [r[0] for r in self._read(database, """
-                    SELECT c.name FROM sys.columns c
-                    JOIN sys.types t ON t.user_type_id = c.user_type_id
-                    WHERE c.object_id = OBJECT_ID(?) AND c.name <> ?
-                      AND t.name IN ('char', 'varchar', 'nchar', 'nvarchar')
-                    ORDER BY c.column_id""", (f"{q(ref_schema)}.{q(ref_table)}", ref_col))[1]]
-                if label == NO_LOOKUP:  # turned off from the header menu
-                    continue
-                col.label_col = guess_label(col.label_options) if label is None else label
-                label = col.label_col
-                jobs.append((col, database, fk_lookup_sql(col.fk, label), f"foreign key to {col.fk}"))
+                label = fk_labels.get(f"{database}.{ref_schema}.{ref_table}")
+                if label != NO_LOOKUP:
+                    tables.append((col, {"db": database, "table": f"{ref_schema}.{ref_table}", "key": ref_col,
+                                         "label": label}, f"foreign key to {col.fk}"))
         for col, db, sql, source in jobs:
             err = check_select(sql)
             if err:
                 raise RuntimeError(f"Lookup for {col.name}: {err}")
             set_choices(col, self._read(db, sql, top=MAX_CHOICES + 1)[1], source)
+        for col, src, source in tables:
+            self.table_lookup(col, src, source)
+        for col in cols:
+            self.sub_lookups(col, col.name, overrides, database, table)
+
+    def sub_lookups(self, col: Col, name: str, overrides: dict, database: str, table: str, depth: int = 0):
+        """Lookups set on label fields ("IssuerID ▸ SectorID"), and on theirs in turn.
+        A small table is read once, a big one per value in use (App._big_lookups)."""
+        col.subs = {}
+        if depth > 4:
+            return
+        for part, field in enumerate(col.label_fields):
+            over = overrides.get(col_key(database, table, f"{name} ▸ {field}"))
+            if not over or over.get("off"):
+                continue
+            sub = Col(f"{name} ▸ {field}", "", False, False, False, external=True)
+            self.table_lookup(sub, {k: over.get(k) for k in ("db", "table", "key", "label")},
+                              f"{over['db']}.{over['table']}.{over['key']} (set by you)")
+            col.subs[part] = sub
+            self.sub_lookups(sub, sub.name, overrides, database, table, depth + 1)
+
+    def table_lookup(self, col: Col, src: dict, source: str) -> None:
+        """Allowed values of `col` from a lookup table; none when it has more
+        rows than a dropdown can list (the server still checks a foreign key)."""
+        col.src = dict(src)
+        schema, name = split_table(src["table"])
+        obj = f"{q(schema)}.{q(name)}"
+        rows = self._read(src["db"], "SELECT SUM(rows) FROM sys.partitions WHERE object_id = OBJECT_ID(?) "
+                                     "AND index_id IN (0, 1)", (obj,))[1]
+        if not rows or rows[0][0] is None:
+            raise RuntimeError(f"Lookup table {src['db']}.{src['table']} not found")
+        if col.src.get("label") is None:
+            col.src["label"] = guess_label(self.text_columns(src["db"], src["table"], src["key"]), src["table"])
+        fields = label_fields(col.src)
+        if int(rows[0][0]) > MAX_CHOICES:  # too many to list: labels are read per value
+            t = self._read(src["db"], "SELECT TYPE_NAME(user_type_id), max_length, precision, scale "
+                                      "FROM sys.columns WHERE object_id = OBJECT_ID(?) AND name = ?",
+                           (obj, src["key"]))[1]
+            if not t:
+                raise RuntimeError(f"Lookup key {src['key']} not found in {src['db']}.{src['table']}")
+            kt = Col("k", t[0][0], False, False, False, max_length=int(t[0][1]), precision=int(t[0][2]),
+                     scale=int(t[0][3]))
+            col.big, col.label_fields, col.lookup = True, fields, f"{source}, {int(rows[0][0]):,} rows"
+            texts = set(self.text_columns(src["db"], src["table"]))
+            col.search_fields = [f for f in fields if f in texts]  # names to find a typed value by
+            col.key_type = (f"{kt.type}({'max' if kt.size == -1 else kt.size})" if kt.type in TEXT_TYPES
+                            else sql_type(kt) or "nvarchar(4000)")
+            return
+        set_choices(col, self._read(src["db"], lookup_sql(src["table"], src["key"], fields),
+                                    top=MAX_CHOICES + 1)[1], source, fields)
+
+    def big_labels(self, col: Col, values: list[str]) -> tuple[dict[str, tuple], set[str]]:
+        """Rows of a big lookup for grid `values`: ({value: label fields}, values not in it).
+        One query per 2,000 values; the key is compared in its own type (TRY_CONVERT), so an
+        index on it is used and text that is no key just finds nothing."""
+        src, fields = col.src, col.label_fields
+        schema, name = split_table(src["table"])
+        cols = ", ".join(q(c) for c in (src["key"], *fields))
+        tbl = f"{q(schema)}.{q(name)}"
+        sql = (f"SELECT {', '.join('t.' + q(c) for c in (src['key'], *fields))} FROM "
+               f"(SELECT DISTINCT TRY_CONVERT({col.key_type}, value) AS k FROM OPENJSON(?)) j "
+               f"JOIN {tbl} t WITH (FORCESEEK) ON t.{q(src['key'])} = j.k")
+        # a seek per value: a cold plan otherwise may scan the whole table; FORCESEEK
+        # needs an index on the key, so without one the plain join is used
+        found: dict[str, tuple] = {}
+        by_norm: dict[str, list[str]] = {}
+        for v in values:
+            by_norm.setdefault(v.strip().lower(), []).append(v)
+        for i in range(0, len(values), 2000):
+            chunk = (json.dumps(values[i:i + 2000]),)
+            try:
+                rows = self._read(src["db"], sql, chunk)[1]
+            except pyodbc.Error as e:
+                if "8622" not in str(e) or self.cancelled:  # 8622: no index to seek
+                    raise
+                sql = sql.replace(" WITH (FORCESEEK)", "")
+                rows = self._read(src["db"], sql, chunk)[1]
+            for r in rows:
+                for v in by_norm.get(str(r[0]).strip().lower(), []):  # same key as the server sees it
+                    found.setdefault(v, tuple(r[1:]))
+        return found, {v for v in values if v not in found}
+
+    def big_search(self, col: Col, text: str, top: int = 200, exact: bool = False) -> list[list[str]]:
+        """Rows of a big lookup whose key or a label field matches `text`: equal to it
+        (`exact`, case as the server compares) or containing it."""
+        src, fields = col.src, col.label_fields
+        schema, name = split_table(src["table"])
+        cols = ", ".join(q(c) for c in (src["key"], *fields))
+        if not text:
+            return self._read(src["db"], f"SELECT TOP ({top}) {cols} FROM {q(schema)}.{q(name)} "
+                                         f"ORDER BY {q(src['key'])}", top=top)[1]
+        like = text if exact else "%" + re.sub(r"([%_\[])", r"[\1]", text) + "%"
+        op = "=" if exact else "LIKE"
+        tests = [f"{q(c)} {op} ?" for c in col.search_fields]
+        if not tests or re.fullmatch(r"-?\d+", text) or col.key_type.startswith(("varchar", "nvarchar", "char")):
+            tests.append(f"CONVERT(nvarchar(4000), {q(src['key'])}) {op} ?")  # key typed: numbers or text keys
+        return self._read(src["db"], f"SELECT TOP ({top}) {cols} FROM {q(schema)}.{q(name)} "
+                                     f"WHERE {' OR '.join(tests)} ORDER BY {q(src['key'])}",
+                          [like] * len(tests), top=top)[1]
+
+    def big_resolve(self, col: Col, text: str) -> tuple[str, tuple] | str:
+        """Typed text -> (key, label fields) of the one row it names, else why not.
+        A text field equal to the text wins; else the one row starting with it; else
+        the one row containing it. Each step is one query (the last scans the table)."""
+        src, fields = col.src, col.label_fields
+        if not col.search_fields:
+            return f"'{text}' is not a key of {src_name(col)}"
+        schema, name = split_table(src["table"])
+        cols = ", ".join(q(c) for c in (src["key"], *fields))
+        pat = re.sub(r"([%_\[])", r"[\1]", text)
+        exact = " + ".join(f"CASE WHEN {q(f)} = ? THEN 1 ELSE 0 END" for f in col.search_fields)
+        for like in (pat + "%", "%" + pat + "%"):
+            tests = " OR ".join(f"{q(f)} LIKE ?" for f in col.search_fields)
+            rows = self._read(src["db"], f"SELECT TOP (6) {cols}, {exact} FROM {q(schema)}.{q(name)} "
+                                         f"WHERE {tests} ORDER BY {exact} DESC",
+                              [text] * len(col.search_fields) + [like] * len(col.search_fields)
+                              + [text] * len(col.search_fields), top=6)[1]
+            hits = [r for r in rows if r[-1] not in ("0", 0)] or rows  # equal beats starting / containing
+            keys = {str(r[0]): r[:-1] for r in hits}
+            if len(keys) == 1:
+                k, r = next(iter(keys.items()))
+                return k, tuple(r[1:])
+            if len(keys) > 1:
+                names = ", ".join(f"{k} {LABEL_SEP.join(str(x) for x in r[1:] if x)}".strip()
+                                  for k, r in list(keys.items())[:3])
+                more = "+" if len(keys) > 5 else ""
+                return f"'{text}' matches {len(keys)}{more} rows ({names}…): use View lookup values"
+        return f"'{text}' is not in {src_name(col)}"
+
+    def text_columns(self, database: str, table: str, but: str = "") -> list[str]:
+        schema, name = split_table(table)
+        return [r[0] for r in self._read(database, """
+            SELECT c.name FROM sys.columns c
+            JOIN sys.types t ON t.user_type_id = c.user_type_id
+            WHERE c.object_id = OBJECT_ID(?) AND c.name <> ?
+              AND t.name IN ('char', 'varchar', 'nchar', 'nvarchar')
+            ORDER BY c.column_id""", (f"{q(schema)}.{q(name)}", but))[1]]
 
     def load(self, database, table, cols: list[Col], where: str, top: int):
         schema, name = split_table(table)
@@ -512,6 +702,7 @@ class Db:
         payloads = [(grid_row, json_obj)]. Returns affected rows."""
         c = self.cur(database, write=True)
         total = 0
+        self.notes = []
         try:
             for sql, payloads, exact in steps:
                 for i in range(0, len(payloads), BATCH):
@@ -522,6 +713,7 @@ class Db:
                         self.cn.rollback()
                         raise self._locate(database, sql, chunk, user, e)
                     n = c.rowcount
+                    self.notes += server_notes(c)
                     if exact and n != len(chunk):
                         raise RowError(None, f"Expected {len(chunk)} rows affected, got {n}. "
                                              "Key is not unique or rows changed on the server.")
@@ -552,13 +744,22 @@ class Db:
         return RowError(None, clean_err(err))
 
 
+def server_notes(c: pyodbc.Cursor) -> list[str]:
+    """Informational messages the statement produced (PRINT, RAISERROR below
+    severity 11, trigger output), cleaned like errors."""
+    return [clean_err(RuntimeError(m[1])) for m in (getattr(c, "messages", None) or [])]
+
+
 def clean_err(e: Exception) -> str:
     s = str(e.args[1] if isinstance(e, pyodbc.Error) and len(e.args) > 1 else e)
     if "HY008" in s or "Operation canceled" in s:
         return "Cancelled"
     s = re.sub(r"^\[\w+\]\s*", "", s)
-    s = re.sub(r"\[Microsoft\]\[ODBC Driver \d+ for SQL Server\]\[SQL Server\]", "", s)
-    return re.sub(r"\s*\(\d+\)\s*\(SQL\w+\)\s*$", "", s).strip()
+    s = re.sub(r"(\[Microsoft\])?\[ODBC Driver \d+ for SQL Server\](\[SQL Server\])?", "", s)
+    s = re.sub(r"\s*\(\d+\)(\s*\(SQL\w+\))?", "\n", s)  # one line per diagnostic record
+    lines = [re.sub(r"^;?\s*(\[\w+\]\s*)?", "", ln.strip()) for ln in s.splitlines()]
+    lines = [ln for ln in lines if ln]
+    return "\n".join(dict.fromkeys(lines))
 
 
 # ── SQL builders ─────────────────────────────────────────────────────────────
@@ -648,10 +849,45 @@ TEXT_TYPES = {"char", "varchar", "nchar", "nvarchar"}
 DATETIME_TYPES = {"datetime", "datetime2", "smalldatetime", "datetimeoffset"}
 
 
+def is_formula(v: str) -> bool:
+    """'=GETDATE()': a SQL expression the server evaluates into the cell."""
+    return len(v) > 1 and v[0] == "="
+
+
+def sql_type(col: "Col") -> str:
+    """The column's type as written in a CAST, or "" when values are not cast to it."""
+    t = col.type  # text stays uncast: the grid's own format beats CAST's 'Nov  9 2026 12:00PM'
+    if t in ("decimal", "numeric"):
+        return f"{t}({col.precision},{col.scale})"
+    if t in ("datetime2", "datetimeoffset", "time"):
+        return f"{t}({col.scale})"
+    if t in INT_RANGE or t in DATETIME_TYPES or t in ("date", "bit", "float", "real", "money",
+                                                      "smallmoney", "uniqueidentifier"):
+        return t
+    return ""
+
+
+def formula_sql(expr: str, n: int, cast: str = "") -> str:
+    """SELECT giving `n` values of `expr` as type `cast`; one row each, so NEWID()
+    differs per cell."""
+    v = f"CAST(({expr}) AS {cast})" if cast else f"({expr})"
+    if n == 1:
+        return f"SELECT {v} AS v"
+    return (f"SELECT {v} AS v FROM (SELECT TOP ({n}) 1 AS x FROM sys.all_columns a "
+            f"CROSS JOIN sys.all_columns b) t")
+
+
 def cell_error(col: "Col", v: str) -> str | None:
     """Why `v` cannot go into `col`, or None when it can. Blank / NULL always can."""
-    if col.external or col.readonly or col.audit:
+    if col.external or col.readonly or col.audit or is_formula(v):  # formulas: checked once evaluated
         return None
+    if col.big and v and v.strip().upper() != "NULL":  # unknown values: see App._big_lookups
+        if v in col.nomatch:
+            return col.nomatch[v]
+        if v in col.missing:
+            return f"Not in the lookup ({src_name(col)})"
+        if v not in col.key_fields:
+            return None
     if col.choices is not None and v not in col.choices and v != "" and v.strip().upper() != "NULL":
         return f"Not in the lookup list ({col.lookup})"
     return _value_error(col.type, col.size, col.precision, col.scale, v)
@@ -673,7 +909,9 @@ def col_info(col: "Col") -> str:
         parts.append("read-only")
     elif col.audit:
         parts.append("set automatically")
-    if col.choices is not None:
+    if col.big:
+        parts.append(f"lookup {col.lookup}: labels read per value")
+    elif col.choices is not None:
         parts.append(f"{len(col.choices):,} allowed values from {col.lookup}")
     elif col.fk:
         parts.append(f"foreign key to {col.fk}")
@@ -709,11 +947,13 @@ def lookup_for(spec: dict, database: str, table: str, column: str):
 NO_LOOKUP = "-"  # saved label choice: no dropdown for this foreign key
 
 
-def guess_label(names: list[str]) -> str:
-    """The text column that most likely names a lookup row: *Name, then
-    *Description, then *Code, then the first; audit columns never."""
+def guess_label(names: list[str], table: str = "") -> str:
+    """The text column that most likely names a lookup row: *Name, then one named
+    like its table (Sector in lookup.Sector), then *Description, then *Code, then
+    the first; audit columns never."""
     names = [n for n in names if not re.search(r"(created|modified|updated)(by|user)$", n, re.I)]
-    for pat in (r"name$", r"desc(ription)?$", r"code$"):
+    own = re.escape(split_table(table)[1].rstrip("s")) if table else "(?!)"
+    for pat in (r"name$", rf"^{own}s?$", r"desc(ription)?$", r"code$"):
         hit = [n for n in names if re.search(pat, n, re.I)]
         if hit:
             return hit[0]
@@ -747,28 +987,101 @@ def resolve_choice(col: "Col", v: str) -> str:
     return col.picked.get(entry, entry)
 
 
-def fk_lookup_sql(fk: str, label: str = "") -> str:
-    """Values of the column a foreign key references, with `label` beside them."""
-    ref_schema, ref_table, ref_col = fk.split(".")
-    shown = f", MIN({q(label)})" if label else ""
-    return (f"SELECT TOP ({MAX_CHOICES + 1}) {q(ref_col)}{shown} FROM {q(ref_schema)}.{q(ref_table)} "
-            f"WHERE {q(ref_col)} IS NOT NULL GROUP BY {q(ref_col)} ORDER BY 1")
+LABEL_MODES = {"Same column (6 · Valoren)": "same", "Value only (Valoren)": "value",
+               "Separate column": "separate", "Off (id only)": "off"}
+LABEL_FORMATS = {"6 · Valoren": "{id} · {label}", "Valoren (6)": "{label} ({id})", "Valoren": "{label}"}
+MISMATCH = {"⚠ before the value": "mark", "Red text": "red", "Both": "both"}
+WARN = "⚠ "
 
 
-def set_choices(col: "Col", rows: list, source: str) -> None:
-    """rows: values, or [value, label] pairs (a second column is shown beside the value)."""
+LABEL_SEP = " · "  # between label fields
+
+
+def label_fields(src: dict) -> list[str]:
+    """The label fields of a table lookup; saved as one name (older settings) or a list."""
+    label = src.get("label")
+    return [label] if isinstance(label, str) and label else list(label or [])
+
+
+def src_name(col: "Col") -> str:
+    src = col.src or {}
+    return f"{src.get('db')}.{src.get('table')}.{src.get('key')}"
+
+
+def field_text(col: "Col", part: int, fv: str, mark: bool) -> str:
+    """Shown text of label field `part` holding `fv`: through its own lookup if it has one."""
+    sub = col.subs.get(part)
+    if sub is None or not fv:
+        return fv
+    known = sub.in_lookup(fv)
+    if known:
+        label = label_of(sub, fv, mark)
+        return sub.fmt.format(id=fv, label=label) if label and sub.fmt else fv
+    return WARN + fv if known is False and mark else fv
+
+
+def label_of(col: "Col", v: str, mark: bool) -> str:
+    """All label fields of key `v`, joined; fields with their own lookup show its label."""
+    if not col.subs:
+        return col.key_label.get(v, "")
+    vals = col.key_fields.get(v, ())
+    return LABEL_SEP.join(t for p, fv in enumerate(vals) if (t := field_text(col, p, str(fv), mark)))
+
+
+def label_text(col: "Col", v: str, mark: bool, part: int | None = None) -> str:
+    """Text of a label column for value `v` of lookup column `col`: all fields,
+    or field number `part`."""
+    if not v:
+        return ""
+    known = col.in_lookup(v)
+    if known is None:  # big lookup, not read yet
+        return ""
+    if known:
+        if part is None:
+            return label_of(col, v, mark)
+        vals = col.key_fields.get(v, ())
+        return field_text(col, part, str(vals[part]), mark) if part < len(vals) else ""
+    return f"{WARN}not in lookup" if mark else "not in lookup"
+
+
+def lookup_sql(table: str, key: str, labels: list[str] = ()) -> str:
+    """Values of a lookup table's key column, with the `labels` fields beside them."""
+    schema, name = split_table(table)
+    if not labels:
+        return (f"SELECT TOP ({MAX_CHOICES + 1}) {q(key)} FROM {q(schema)}.{q(name)} "
+                f"WHERE {q(key)} IS NOT NULL GROUP BY {q(key)} ORDER BY 1")
+    cols = ", ".join(q(c) for c in (key, *labels))
+    # one row per key; ROW_NUMBER, not MIN(), so a field of any type (bit, ...) works
+    return (f"SELECT TOP ({MAX_CHOICES + 1}) {cols} FROM (SELECT {cols}, ROW_NUMBER() OVER "
+            f"(PARTITION BY {q(key)} ORDER BY (SELECT 0)) AS [rn·] FROM {q(schema)}.{q(name)} "
+            f"WHERE {q(key)} IS NOT NULL) x WHERE [rn·] = 1 ORDER BY 1")
+
+
+def col_key(database: str, table: str, column: str) -> str:
+    """Settings key of a column: database.schema.table.column, lower case."""
+    return ".".join((database, *split_table(table), column)).lower()
+
+
+def set_choices(col: "Col", rows: list, source: str, fields: list[str] = ()) -> None:
+    """rows: values, or [value, label, ...] (the other columns are shown beside the
+    value). `fields` names those columns."""
     rows = [r if isinstance(r, (list, tuple)) else [r] for r in rows]
     rows = list({str(r[0]): r for r in rows if r and str(r[0]) != ""}.values())
     if len(rows) > MAX_CHOICES:  # too many to list: leave it to the server
         return
+    width = max((len(r) for r in rows), default=1) - 1
+    col.label_fields = list(fields)[:width] or (["label"] if width else [])
+    col.label_fields += [f"label {i + 1}" for i in range(len(col.label_fields), width)]
     col.choices, col.lookup = frozenset(str(r[0]) for r in rows), source
-    col.choice_list, col.picked, col.key_label = [], {}, {}
+    col.choice_list, col.picked, col.key_label, col.key_fields = [], {}, {}, {}
     for r in rows:
-        key, label = str(r[0]), str(r[1]) if len(r) > 1 and r[1] not in (None, "") else ""
+        key = str(r[0])
+        vals = tuple("" if v is None else str(v) for v in r[1:]) + ("",) * (width - len(r) + 1)
+        label = LABEL_SEP.join(v for v in vals if v)
         entry = f"{key}  ·  {label}" if label else key
         col.choice_list.append(entry)
         if label:
-            col.picked[entry], col.key_label[key] = key, label
+            col.picked[entry], col.key_label[key], col.key_fields[key] = key, label, vals
 
 
 @functools.lru_cache(maxsize=65536)
@@ -934,6 +1247,10 @@ class Tab:
         self.note = ("Ready", False)
         self.job: tuple | None = None  # (label, started, cancellable) while a job runs
         self.bad: dict[tuple[int, int], str] = {}  # (data row, column) -> why the value is invalid
+        self.fx_out: set[str] = set()  # values formulas produced: never evaluated again
+        self.fx_err: dict[str, str] = {}  # formula -> server error, not retried until edited
+        self.fx_hold = False  # evaluation cancelled or failed: wait for the next typed formula
+        self.lk_hold = False  # same for reading big lookups
         self.label: tk.Label | None = None  # its tab in the tab strip
 
     @property
@@ -952,6 +1269,10 @@ class App:
         self.jobs: queue.Queue = queue.Queue()
         self._mark_after = None
         self._fx_cell = None  # (tab, data row, Col, text shown) the fx bar is editing
+        self.log: list[tuple[str, str, str, bool]] = []  # (time, sheet, text, error), see msg
+        self._abandoned: dict[object, Db] = {}  # job token -> connection replaced after Cancel
+        self._running: set[object] = set()  # tokens of jobs whose worker has not returned
+        root.report_callback_exception = self._uncaught
         self.tabs: list[Tab] = []
         self.tab: Tab | None = None  # tab App code works on; differs from shown only
         self.shown: Tab | None = None  # while a background tab's job finishes (_in)
@@ -998,6 +1319,12 @@ class App:
         s.map("TCheckbutton", background=[("active", C["surface"])],
               indicatorbackground=[("selected", C["button"])],
               indicatorforeground=[("selected", "#ffffff")])
+        s.configure("Treeview", background=C["surface"], fieldbackground=C["surface"], foreground=C["text"],
+                    bordercolor=C["line"], rowheight=24, font=FONT)
+        s.map("Treeview", background=[("selected", C["accent_soft"])], foreground=[("selected", C["text"])])
+        s.configure("Treeview.Heading", background=C["header"], foreground=C["text2"], font=FONT,
+                    bordercolor=C["line"], relief="flat")
+        s.map("Treeview.Heading", background=[("active", C["hover"])])
         s.configure("Vertical.TScrollbar", background=C["bg"], troughcolor=C["surface"],
                     bordercolor=C["surface"], arrowcolor=C["text2"])
         s.configure("Horizontal.TScrollbar", background=C["bg"], troughcolor=C["surface"],
@@ -1147,7 +1474,8 @@ class App:
 
         self.cb_db = ttk.Combobox(bar, textvariable=self.v_db, width=14, state="readonly")
         self.cb_db.pack(side="left")
-        self.cb_db.bind("<<ComboboxSelected>>", lambda e: self.pick_db())
+        # a database picked by hand starts with no table: the old one belongs elsewhere
+        self.cb_db.bind("<<ComboboxSelected>>", lambda e: (self.v_table.set(""), self.pick_db()))
         Hint(self, self.cb_db, self.v_db, "Database")
         self.cb_table = ttk.Combobox(bar, textvariable=self.v_table, width=22)
         self.cb_table.pack(side="left", padx=(8, 0))
@@ -1234,8 +1562,9 @@ class App:
                                                   command=self.cancel_job), "x")
         self.l_stats = ttk.Label(foot, text="", style="Status.TLabel")
         self.l_stats.pack(side="right", padx=(16, 0))
-        self.l_msg = ttk.Label(foot, text="Ready", style="Status.TLabel")
+        self.l_msg = ttk.Label(foot, text="Ready", style="Status.TLabel", cursor="hand2")
         self.l_msg.pack(side="left", fill="x", expand=True)
+        self.l_msg.bind("<Button-1>", lambda e: MessageLog(self))
 
         self.busy_buttons = [self.b_load, self.b_blank, self.b_insert,
                              self.b_update, self.b_paste, self.b_import, self.b_run]
@@ -1266,7 +1595,7 @@ class App:
                 header_font=(CELL[0], CELL[1], "normal"), index_font=(CELL[0], CELL[1], "normal"),
                 paste_can_expand_x=False, paste_can_expand_y=True, show_x_scrollbar=True,
                 default_row_height=22, default_column_width=110, default_row_index_width=48,
-                header_align="center", index_align="center", **sheet_colors(),
+                header_align="center", index_align="center", find_bindings=["<Control-f>"], **sheet_colors(),
             )
         finally:
             tk.Misc.update_idletasks = idle
@@ -1279,6 +1608,34 @@ class App:
                    lambda e: (self._sync_columns(), self._schedule_marks(), self._on_select()))
         sheet.bind("<<SheetSelect>>", lambda e: (self._on_select(), self._place_handle()))
         sheet.edit_validation(self._validate_edit)
+        sheet.disp = {}  # data column -> fn(stored text) -> shown text, see _label_display
+        raw_str = sheet.MT.cell_str
+
+        def cell_str(datarn, datacn, get_displayed=False, **kw):
+            text = raw_str(datarn, datacn, get_displayed, **kw)
+            fn = sheet.disp.get(datacn) if get_displayed else None
+            return fn(text) if fn else text
+
+        sheet.MT.cell_str = cell_str
+        raw_find = sheet.MT.find_match
+
+        def find_match(find, r, c):  # Ctrl+F: the stored id or the label shown with it
+            if raw_find(find, r, c):
+                return True
+            fn, col = sheet.disp.get(c), self.cols[c] if c < len(self.cols) else None
+            if not find or (fn is None and not (col and col.labelled)):
+                return False
+            try:
+                v = sheet.MT.data[r][c]
+            except IndexError:
+                return False
+            v = "" if v is None else str(v)
+            shown = fn(v) if fn else label_of(col, v, False)
+            return find in shown.lower()
+
+        sheet.MT.find_match = find_match
+        for w in (sheet.MT, sheet.CH, sheet.RI):
+            w.bind("<Control-F>", lambda e: (self.find_column(), "break")[1])
         sheet.MT.bind("<Motion>", self._hover_cell, add="+")
         sheet.CH.bind("<Motion>", self._hover_header, add="+")
         self.sheet = sheet
@@ -1559,6 +1916,12 @@ class App:
         if col.readonly or col.audit:
             self._fx_cell = (tab, r, col, new)
             return self.msg(f"{col.name} is read-only", error=True)
+        if is_formula(new):
+            self._retry_formula(new)
+        if col.big:
+            self.tab.lk_hold = False
+            col.nomatch.pop(new, None)
+            col.missing.discard(new)
         new = resolve_choice(col, new)
         if new != self.v_fx.get():
             self.v_fx.set(new)
@@ -1578,7 +1941,17 @@ class App:
         c = event.column
         if event.eventname == "end_edit_table" and c < len(self.cols):
             col = self.cols[c]
-            value = resolve_choice(col, "" if event.value is None else str(event.value))  # label -> key
+            value = "" if event.value is None else str(event.value)
+            if is_formula(value):
+                self._retry_formula(value)
+                return value
+            value = resolve_choice(col, value)  # label -> key
+            if col.big:
+                self.tab.lk_hold = False
+                col.nomatch.pop(value, None)  # typed again: ask again
+                col.missing.discard(value)
+                if value not in col.key_fields:  # a key or a name: the server says which
+                    return value
             err = cell_error(col, value)
             if err:
                 self.msg(f"{self.cols[c].name}: {err}", error=True)
@@ -1627,7 +2000,9 @@ class App:
                                ("Filter…", self.filter_dialog, "Ctrl+Shift+L"),
                                ("Clear filter", self.clear_filter, None),
                                ("Autofit column", self.autofit, None),
-                               ("Lookup label…", self.lookup_label, None)):
+                               ("Lookup…", self.lookup_edit, None),
+                               ("View lookup values…", self.lookup_view, None),
+                               ("Label display…", self.label_display_menu, None)):
             s.popup_menu_add_command(label, fn, table_menu=False, index_menu=False,
                                      empty_space_menu=False, accelerator=acc)
         for label, fn, acc in (("Fill down", self.fill_down, "Ctrl+D"),
@@ -1738,10 +2113,10 @@ class App:
         if not self.filters:
             self.sheet.display_rows("all", all_rows_displayed=True, redraw=True)
         else:
-            data = self.sheet.get_sheet_data()
-            keep = [r for r, row in enumerate(data)
-                    if all(excel_ops.matches("" if row[idx[k]] is None else str(row[idx[k]]), spec)
-                           for k, spec in self.filters.items())]
+            # blank spare rows under the data are not part of it: never filtered
+            keep = [r for r, row in enumerate(self._rows())
+                    if self._spare(row) or all(excel_ops.matches(row[idx[k]], spec)
+                                               for k, spec in self.filters.items())]
             self.sheet.display_rows(keep, all_rows_displayed=False, redraw=True)
         self._marks()
 
@@ -1936,7 +2311,10 @@ class App:
         Cancel button (for reads: Db.cancel stops the running statement)."""
         tab = self.tab
         t0 = dt.datetime.now()
-        tab.job = (label, t0, cancel)
+        token = object()  # identifies this job; a cancelled job's result is dropped
+        tab.job = (label, t0, cancel, token)
+        self._running.add(token)
+        tab.db.begin()
         self._busy = True
         self._refresh_buttons()
         self.msg(label + " …")
@@ -1944,18 +2322,22 @@ class App:
         def run():
             try:
                 res = work()
-                self.jobs.put((tab, done, res, None, t0))
+                self.jobs.put((tab, done, res, None, t0, token))
             except Exception as e:  # noqa: BLE001 - surfaced in UI
-                self.jobs.put((tab, done, None, e, t0))
+                self.jobs.put((tab, done, None, e, t0, token))
 
         threading.Thread(target=run, daemon=True).start()
 
     def _poll(self):
         try:
             while True:
-                tab, done, res, err, t0 = self.jobs.get_nowait()
-                if tab not in self.tabs:
-                    continue
+                tab, done, res, err, t0, token = self.jobs.get_nowait()
+                self._running.discard(token)
+                old = self._abandoned.pop(token, None)
+                if old is not None:  # its connection was replaced after a cancel
+                    threading.Thread(target=old.close, daemon=True).start()
+                if tab not in self.tabs or not tab.job or tab.job[3] is not token:
+                    continue  # cancelled (or tab closed): nothing to show
                 secs = (dt.datetime.now() - t0).total_seconds()
 
                 def finish():
@@ -1965,6 +2347,9 @@ class App:
                         self._show_error(err)
                     elif done:
                         done(res, secs)
+                        if tab.db.notes:  # PRINT / trigger messages of that job
+                            text, error = tab.note
+                            self.msg(f"{text}\nServer: " + "\n".join(tab.db.notes), error)
                     self._refresh_buttons()
                     self._marks()
 
@@ -1983,7 +2368,7 @@ class App:
         t = self.shown
         if not t or not t.job:
             return
-        label, t0, _ = t.job
+        label, t0 = t.job[:2]
         secs = (dt.datetime.now() - t0).total_seconds()
         if secs < 0.5:
             return
@@ -2003,7 +2388,32 @@ class App:
             self.b_cancel.pack_forget()
 
     def cancel_job(self):
-        self.shown.db.cancel()
+        """Cancel always frees the sheet at once. The server is asked to stop;
+        if the connection has not answered within 2 s (blocked server, dead
+        network) the sheet gets a fresh connection and the old one is closed
+        when its statement finally returns."""
+        t = self.shown
+        if not t or not t.job:
+            return
+        token, db = t.job[3], t.db
+        db.cancel()
+        t.job, t._busy = None, False
+        self._refresh_buttons()
+        self._marks()
+        self.msg("Cancelled")
+
+        def check():
+            if token not in self._running or t not in self.tabs or t.db is not db:
+                return  # it stopped in time
+            self._abandoned[token] = db  # closed when its worker returns
+            fresh = Db()
+            t.db = fresh
+            if db.args:
+                def done(_, secs):
+                    self.msg("Cancelled · reconnected")
+                self._in(t, lambda: self.bg("Reconnecting", lambda: fresh.connect(*db.args), done))
+
+        self.root.after(2000, check)
 
     def _show_error(self, err):
         if isinstance(err, RowError):
@@ -2017,9 +2427,25 @@ class App:
             self.msg(clean_err(err), error=True)
 
     def msg(self, text, error=False):
-        self.tab.note = (text, error)
+        """Bottom-bar message. Multi-line text shows on one line; click the bar
+        for the full text of recent messages (MessageLog)."""
+        text = str(text)
+        if error or "\n" in text or len(text) > 160:
+            self.log.append((dt.datetime.now().strftime("%H:%M:%S"), self.tab.title, text, error))
+            del self.log[:-200]
+        line = " · ".join(ln.strip() for ln in text.splitlines() if ln.strip())
+        self.tab.note = (line, error)
         if self.tab is self.shown:
-            self.l_msg.configure(text=text, style="Err.TLabel" if error else "Status.TLabel")
+            self.l_msg.configure(text=line, style="Err.TLabel" if error else "Status.TLabel")
+
+    def _uncaught(self, exc, val, tb):
+        """Errors in UI callbacks: bottom bar + log, never a silent stderr line."""
+        import traceback
+        detail = "".join(traceback.format_exception(exc, val, tb))
+        try:
+            self.msg(f"Unexpected error: {val!r}\n\n{detail}", error=True)
+        except Exception:  # noqa: BLE001 - while starting up / shutting down
+            sys.stderr.write(detail)
 
     def _set_table_state(self, on: bool):
         for b in (self.b_insert, self.b_update, self.b_paste, self.b_import,
@@ -2057,6 +2483,11 @@ class App:
 
         db = self.db
         self.bg("Listing tables", lambda: db.tables(database), done)
+
+    def _lookup_prefs(self) -> dict:
+        """Lookups chosen from the header menu, copied for a worker thread."""
+        return {"lookups": dict(self.settings.get("lookups", {})),
+                "fk_labels": dict(self.settings.get("fk_labels", {}))}
 
     def _lookup_spec(self) -> dict | None:
         """The lookup file from Settings, read fresh so edits apply on the next Load."""
@@ -2119,11 +2550,11 @@ class App:
         spec = self._lookup_spec()
         if spec is None:
             return
-        labels = dict(self.settings.get("fk_labels", {}))
+        prefs = self._lookup_prefs()
 
         def work():
             cols = db.columns(database, table)
-            db.lookups(database, table, cols, spec, labels)
+            db.lookups(database, table, cols, spec, prefs)
             return database, table, cols, db.load(database, table, cols, where, top)
 
         def done(res, secs):
@@ -2149,11 +2580,11 @@ class App:
         spec = self._lookup_spec()
         if spec is None:
             return
-        labels = dict(self.settings.get("fk_labels", {}))
+        prefs = self._lookup_prefs()
 
         def work():
             cols = db.columns(database, table)
-            db.lookups(database, table, cols, spec, labels)
+            db.lookups(database, table, cols, spec, prefs)
             return database, table, cols
 
         self.bg("Reading columns", work, done)
@@ -2178,7 +2609,7 @@ class App:
         spec = self._lookup_spec()
         if spec is None:
             return
-        labels = dict(self.settings.get("fk_labels", {}))
+        prefs = self._lookup_prefs()
         try:
             top = max(1, int(self.v_top.get()))
         except ValueError:
@@ -2191,7 +2622,7 @@ class App:
             srcs = db.sources(database, sql)
             tdb, target, table_cols = edit_target(db, database, table, srcs)
             if table_cols:
-                db.lookups(tdb, target, table_cols, spec, labels)
+                db.lookups(tdb, target, table_cols, spec, prefs)
             tables = db.tables(tdb) if tdb and tdb != database else None
             return tdb or database, target, table_cols, names, rows, srcs, tables
 
@@ -2268,8 +2699,17 @@ class App:
             k = c.label.lower()  # a repeat gets invisible zero-width spaces appended
             c.label += "\u200b" * seen.get(k, 0)
             seen[k] = seen.get(k, 0) + 1
+        self._show(cols, data, self.orig)
+
+    def _show(self, cols, data, orig):
+        """Put columns, rows (with row ids) and loaded values on the sheet, adding
+        label columns for lookups shown in a separate column."""
+        cols, data, orig = self._add_label_cols(cols, data, orig)
+        self.cols, self.orig = cols, orig
+        n = len(cols)
         self.filters = {}
         self.sheet.display_rows("all", all_rows_displayed=True)
+        self.sheet.disp = {}  # old display rules may name columns that changed
         self.sheet.set_sheet_data(data, reset_col_positions=True)
         self.sheet.headers([c.label for c in cols] + ["__rid"])
         self.sheet.display_columns(list(range(n)), all_columns_displayed=False)
@@ -2278,42 +2718,221 @@ class App:
         self._fit_columns(data)
         self._marks()
 
-    def lookup_label(self):
-        """Header menu: correct what a foreign key dropdown shows beside the key
-        (or turn the dropdown off). Remembered for the referenced table."""
+    def _label_mode(self, col: "Col") -> str:
+        """same / value / separate / off for a lookup column: its own choice, else Settings."""
+        own = self.settings.get("label_modes", {}).get(col_key(self.database, self.table, col.name)) \
+            if self.table else None
+        return own or self.settings.get("label_display", "same")
+
+    def _label_fmt(self, mode: str) -> str:
+        return "{label}" if mode == "value" else self.settings.get("label_format", "{id} · {label}")
+
+    def _sub_formats(self):
+        """How each sub lookup's values show: its own mode ("separate" = id · value)."""
+        def walk(c):
+            for sub in c.subs.values():
+                m = self._label_mode(sub)
+                sub.fmt = "" if m == "off" else self._label_fmt(m)
+                walk(sub)
+        for c in self.cols:
+            if c.of is None:
+                walk(c)
+
+    def _add_label_cols(self, cols, data, orig):
+        """A read-only "<column> ▸ label" column after each lookup column shown in
+        separate mode. Never written; refreshed from the id as it changes."""
+        mark = self.settings.get("mismatch", "both") in ("mark", "both")
+        self._sub_formats()
+        out, extra = [], {}
+        for i, c in enumerate(cols):
+            out.append(c)
+            if c.of is None and c.labelled and self._label_mode(c) == "separate":
+                for part, field in enumerate(c.label_fields):
+                    v = Col(f"{c.name} ▸ {field}", "", False, False, False, external=True)
+                    v.of, v.part, v.label = c, part, f"{c.label} ▸ {field}"
+                    out.append(v)
+                extra[i] = c
+        if not extra:
+            return cols, data, orig
+        n = len(cols)
+
+        def widen(r):
+            row = []
+            for i in range(n):
+                row.append(r[i])
+                if i in extra:
+                    c = extra[i]
+                    row += [label_text(c, r[i] or "", mark, p) for p in range(len(c.label_fields))]
+            return row
+
+        return out, [widen(r) + r[n:] for r in data], {k: widen(o) for k, o in orig.items()}
+
+    def _relabel(self):
+        """Rebuild label columns after a display or lookup change; edits stay."""
+        if not self.cols:
+            return
+        n = len(self.cols)
+        rows = self._rows()
+        keep = [i for i, c in enumerate(self.cols) if c.of is None]
+        cols = [self.cols[i] for i in keep]
+        data = [[r[i] for i in keep] + [r[n]] for r in rows]
+        orig = {k: [o[i] for i in keep] for k, o in self.orig.items()}
+        cur = self.sheet.get_currently_selected()
+        at = (cur.row, self.cols[cur.column], cur.type_) if cur and cur.column < n else None
+        self._show(cols, data, orig)
+        if at and at[1] in self.cols:  # same cell / column stays selected
+            c = self.cols.index(at[1])
+            if at[2] == "columns":
+                self.sheet.select_column(c)
+            else:
+                self.sheet.select_cell(at[0], c)
+
+    def _label_display(self):
+        """Shown text of lookup cells: "6 · Valoren" in same mode, a ⚠ before a
+        value missing from the lookup. Render only - the cell keeps the id."""
+        mark = self.settings.get("mismatch", "both") in ("mark", "both")
+        self._sub_formats()
+        disp = {}
+        for i, c in enumerate(self.cols):
+            if c.of is not None or (c.choices is None and not c.big):  # label columns hold shown text
+                continue
+            mode = self._label_mode(c)
+            same = mode in ("same", "value") and c.labelled
+            if not same and not mark:
+                continue
+            fmt = self._label_fmt(mode)
+
+            def fn(v, c=c, same=same, fmt=fmt):
+                known = c.in_lookup(v) if v else None
+                if known is None:
+                    return v
+                if known:
+                    label = label_of(c, v, mark) if same else None
+                    return fmt.format(id=v, label=label) if label else v
+                return WARN + v if mark else v
+
+            disp[i] = fn
+        self.sheet.disp = disp
+
+    def _sync_labels(self, rows):
+        """Label columns follow their id column (typed, pasted, filled)."""
+        mark = self.settings.get("mismatch", "both") in ("mark", "both")
+        data = self.sheet.MT.data
+        for vi, c in enumerate(self.cols):
+            if c.of is None or c.of not in self.cols:
+                continue
+            si = self.cols.index(c.of)
+            for gi, r in enumerate(rows):
+                want = label_text(c.of, r[si], mark, c.part)
+                if r[vi] != want:
+                    r[vi] = data[gi][vi] = want
+
+    def label_display_menu(self):
+        """Header menu: how this lookup column shows labels (overrides Settings)."""
+        i = self._col()
+        if i is None:
+            return
+        col = self.cols[i].of or self.cols[i]
+        if not col.labelled:
+            return self.msg(f"{col.name} has no lookup labels to show", error=True)
+        pick = LabelModeDialog(self, col).result
+        if pick is None:
+            return
+        modes = self.settings.setdefault("label_modes", {})
+        key = col_key(self.database, self.table, col.name)
+        if pick == "default":
+            modes.pop(key, None)
+        else:
+            modes[key] = pick
+        save_settings(self.settings)
+        self._relabel()
+
+    def lookup_edit(self):
+        """Header menu: choose the lookup of a column - its table, key and the
+        column shown beside the key - or turn it off, or back to automatic.
+        Remembered per column."""
         i = self._col()
         if i is None:
             return
         col = self.cols[i]
-        if not col.ref_name:
-            return self.msg(f"{col.name} has no foreign key lookup", error=True)
-        pick = LabelDialog(self, col).result
-        if pick is None:
+        if col.of is not None and col.part is not None:  # a label field: its own lookup
+            top = col.of
+            col = top.subs.get(col.part) or Col(col.name, "", False, False, False, external=True)
+        elif col.external or col.readonly or not self.table:
+            return self.msg(f"{col.name} is read-only: no lookup", error=True)
+        else:
+            top = col
+        if not self.table:
+            return self.msg("Lookups belong to a table: load one first", error=True)
+        dlg = LookupDialog(self, col)
+        if dlg.result is None and not dlg.subs_changed:
             return
-        self.settings.setdefault("fk_labels", {})[col.ref_name] = pick
-        save_settings(self.settings)
-        tab, database, db = self.tab, self.database, self.db
-        cols = [c for c in self.cols if c.ref_name == col.ref_name]
+        if dlg.result is not None:
+            self.save_lookup(col.name, dlg.result, dlg.show)
+        col = top
+        spec = self._lookup_spec()
+        if spec is None:
+            return
+        tab, database, table, db, prefs = self.tab, self.database, self.table, self.db, self._lookup_prefs()
+        cols = [c for c in self.cols if c.name == col.name and not c.external]
 
         def work():
-            if pick == NO_LOOKUP:
-                return None
-            return db._read(database, fk_lookup_sql(col.fk, pick), top=MAX_CHOICES + 1)[1]
+            db.lookups(database, table, cols, spec, prefs)
 
-        def done(rows, secs):
-            for c in cols:
-                c.label_col = "" if pick == NO_LOOKUP else pick
-                if rows is None:
-                    c.choices, c.choice_list, c.picked, c.key_label = None, [], {}, {}
-                else:
-                    set_choices(c, rows, c.lookup or f"foreign key to {c.fk}")
+        def done(_, secs):
             if self.tab is tab:
-                self._dropdowns()
-                self._marks()
-                self.msg(f"{col.name}: " + ("no dropdown" if rows is None else
-                                            f"showing {pick}" if pick else "key only"))
+                self._relabel()
+                self.msg(f"{col.name}: " + (f"lookup {col.lookup}, labels read per value" if col.big else
+                                            "no dropdown" if col.choices is None else
+                                            f"{len(col.choices):,} values from {col.lookup}"))
 
         self.bg("Reading lookup", work, done)
+
+    def save_lookup(self, name: str, pick, show: str):
+        """Remember a lookup choice ("auto", {"off"}, a table) and its display for column / field `name`."""
+        key = col_key(self.database, self.table, name)
+        modes = self.settings.setdefault("label_modes", {})
+        if show == "default":
+            modes.pop(key, None)
+        else:
+            modes[key] = show
+        lookups = self.settings.setdefault("lookups", {})
+        if pick == "auto":
+            lookups.pop(key, None)
+        else:
+            lookups[key] = pick
+        save_settings(self.settings)
+
+    def find_column(self):
+        """Ctrl+Shift+F: jump to a column by (part of) its name."""
+        if self.cols:
+            ColumnFind(self)
+
+    def lookup_view(self):
+        """Header menu: every allowed value of the column with its label."""
+        i = self._col()
+        if i is None:
+            return
+        col = self.cols[i]
+        if col.choices is None and not col.big:
+            return self.msg(f"{col.name} has no lookup list" + (f" ({col.lookup})" if col.lookup else ""),
+                            error=True)
+        LookupView(self, col)
+
+    def put_value(self, col: "Col", value: str):
+        """Write `value` into the selected cells of `col` (from LookupView)."""
+        c = self.cols.index(col)
+        rows = sorted({self._dr(r) for r, cc in self.sheet.get_selected_cells() if cc == c})
+        if not rows:
+            cur = self.sheet.get_currently_selected()
+            rows = [self._dr(cur.row)] if cur and cur.column == c else []
+        if not rows:
+            return self.msg(f"Select cells in {col.name} first", error=True)
+        for r in rows:
+            self.sheet.set_cell_data(r, c, value)
+        self.sheet.redraw()
+        self._on_select()
+        self._schedule_marks()
 
     def _dropdowns(self):
         """Lookup columns get a dropdown of their allowed values (blank = NULL first)."""
@@ -2419,7 +3038,12 @@ class App:
             return
         rows = self._rows()
         self._sync_twins(rows)
+        self._sub_formats()
+        self._sync_labels(rows)
+        self._label_display()
         new, edited = self._diff(rows)
+        self._formulas(rows, new, edited)
+        self._big_lookups(rows, new, edited)
         self.sheet.dehighlight_all(redraw=False)
         ro = [i for i, c in enumerate(self.cols) if c.readonly or c.audit]
         if ro:
@@ -2431,7 +3055,7 @@ class App:
         for i, c in enumerate(self.cols):  # keys and lookups stand out in the header
             if c.is_pk and not c.external:
                 self.sheet.highlight_cells(row=0, column=i, canvas="header", fg=C["accent"], redraw=False)
-            elif c.choices is not None or c.fk:
+            elif c.choices is not None or c.big or c.fk:
                 self.sheet.highlight_cells(row=0, column=i, canvas="header", fg=C["link"], redraw=False)
         filtered = [i for i, c in enumerate(self.cols) if c.label in self.filters]
         for i in filtered:
@@ -2439,6 +3063,11 @@ class App:
                                        fg=C["accent"], redraw=False)
         if cells:
             self.sheet.highlight_cells(cells=cells, bg=C["edited"], redraw=False)
+        if self.settings.get("mismatch", "both") in ("red", "both"):  # values missing from a lookup
+            miss = [(gi, ci) for ci, c in enumerate(self.cols) if c.of is None and (c.choices is not None or c.big)
+                    for gi, r in enumerate(rows) if r[ci] and c.in_lookup(r[ci]) is False]
+            if miss:
+                self.sheet.highlight_cells(cells=miss, fg=C["error"], redraw=False)
         bad = self.bad = self._bad_cells(rows, new, edited)
         if bad:
             self.sheet.highlight_cells(cells=list(bad), bg=C["old"], fg=C["error"], redraw=False)
@@ -2463,6 +3092,147 @@ class App:
         self.l_status.configure(text="  ·  ".join(p for p in parts if p))
         self._top_up(rows)
 
+    def _formula_cells(self, rows, new, edited) -> dict[str, list[tuple[int, int]]]:
+        """Formula -> its cells, among entered values (loaded data is never evaluated).
+        Errors are kept per formula and column type: 'formula\ttype'."""
+        t, out = self.tab, {}
+        ok = {ci for ci, col in enumerate(self.cols) if not (col.external or col.readonly or col.audit)}
+        cells = [(gi, ci) for gi, _ in new for ci in ok]
+        cells += [(gi, ci) for gi, _, ch in edited for ci in ch if ci in ok]
+        for gi, ci in cells:
+            v = rows[gi][ci]
+            if is_formula(v) and v not in t.fx_out:
+                out.setdefault(f"{v}\t{sql_type(self.cols[ci])}", []).append((gi, ci))
+        return out
+
+    def _retry_formula(self, expr: str):
+        """Typed again: evaluate it again (the error may have been fixed on the server)."""
+        t = self.tab
+        t.fx_err = {k: v for k, v in t.fx_err.items() if k.split("\t")[0] != expr}
+        t.fx_hold = False
+
+    def _formulas(self, rows, new, edited):
+        """Evaluate entered formulas (=GETDATE(), =NEWID(), =UPPER('x'), =(SELECT …))
+        on the server as read-only SELECTs, and put the results in their cells."""
+        t = self.tab
+        todo = {e: c for e, c in self._formula_cells(rows, new, edited).items() if e not in t.fx_err}
+        if not todo or self._busy or t.fx_hold or t.db.cn is None:
+            return
+        db, database = self.db, self.database
+        t.fx_hold = True  # stays set if cancelled, so Cancel is not undone by the next redraw
+
+        def work():
+            res = {}
+            for key, cells in todo.items():
+                expr, cast = key.split("\t")
+                sql = formula_sql(expr[1:], len(cells), cast)
+                err = check_select(sql)
+                if err:
+                    res[key] = RuntimeError(err)
+                    continue
+                try:
+                    vals = [r[0] for r in db._read(database, sql, top=len(cells))[1]]
+                    res[key] = vals + vals[-1:] * (len(cells) - len(vals)) if vals else [""] * len(cells)
+                except Exception as e:  # noqa: BLE001 - shown on the cell
+                    if db.cancelled:
+                        raise
+                    res[key] = e
+            return res
+
+        def done(res, secs):
+            t.fx_hold = False
+            now = self._rows()
+            failed, n = [], 0
+            for key, out in res.items():
+                expr = key.split("\t")[0]
+                if isinstance(out, Exception):
+                    t.fx_err[key] = clean_err(out)
+                    failed.append(f"{expr}: {t.fx_err[key]}")
+                    continue
+                for (gi, ci), v in zip(todo[key], out):
+                    if gi < len(now) and now[gi][ci] == expr:  # not changed meanwhile
+                        t.fx_out.add(v)
+                        self.sheet.set_cell_data(gi, ci, v, redraw=False)
+                        n += 1
+            if failed:
+                self.msg("Formula failed: " + "\n".join(failed), error=True)
+            else:
+                self.msg(f"{n:,} formula cell{'s' * (n != 1)} evaluated ({secs:.1f}s)")
+            self.sheet.redraw()
+
+        self.bg("Evaluating formulas", work, done, cancel=True)
+
+    def _big_lookups(self, rows, new, edited):
+        """Big lookups (too many rows to list): read the label fields of the values in
+        the grid, in the background. An entered value that is no key is looked up by
+        its label and replaced by the key of the one row it names."""
+        t = self.tab
+        if self._busy or t.lk_hold or t.db.cn is None:
+            return
+        entered = {(gi, ci) for gi, _ in new for ci in range(len(self.cols))}
+        entered |= {(gi, ci) for gi, _, ch in edited for ci in ch}
+        todo = []
+        for ci, c in enumerate(self.cols):
+            if not c.big or c.of is not None:
+                continue
+            vals = {r[ci] for r in rows} - {""}
+            ask = [v for v in vals if v not in c.key_fields and v not in c.missing and not is_formula(v)
+                   and v.strip().upper() != "NULL"]
+            typed = {rows[gi][cc] for gi, cc in entered if cc == ci}
+            if ask:
+                todo.append((c, ask, typed))
+            stack = [(c, vals)]  # sub lookups: the field values of the keys in use
+            while stack:
+                owner, used = stack.pop()
+                for part, sub in owner.subs.items():
+                    fvs = {str(owner.key_fields[v][part]) for v in used
+                           if v in owner.key_fields and part < len(owner.key_fields[v])} - {"", "None"}
+                    if sub.big:
+                        sub_ask = [v for v in fvs if v not in sub.key_fields and v not in sub.missing]
+                        if sub_ask:
+                            todo.append((sub, sub_ask, set()))
+                    stack.append((sub, fvs))
+        if not todo:
+            return
+        db = self.db
+        t.lk_hold = True  # stays set if cancelled or failed
+
+        def work():
+            out = []
+            for c, ask, typed in todo:
+                found, missing = db.big_labels(c, ask)
+                named = {v: db.big_resolve(c, v) for v in missing if v in typed}
+                out.append((c, found, missing, named))
+            return out
+
+        def done(out, secs):
+            t.lk_hold = False
+            now = self._rows()
+            n = 0
+            for c, found, missing, named in out:
+                for v, vals in found.items():
+                    c.key_fields[v], c.key_label[v] = vals, LABEL_SEP.join(str(x) for x in vals if x)
+                c.missing |= missing
+                if c not in self.cols:
+                    continue
+                ci = self.cols.index(c)
+                for text, res in named.items():
+                    if isinstance(res, str):
+                        c.nomatch[text] = res
+                        continue
+                    key, vals = res
+                    c.key_fields[key], c.key_label[key] = vals, LABEL_SEP.join(str(x) for x in vals if x)
+                    for gi, r in enumerate(now):
+                        if r[ci] == text and (gi, ci) in entered:
+                            self.sheet.set_cell_data(gi, ci, key, redraw=False)
+                            n += 1
+            found = sum(len(f) for _, f, _, _ in out)
+            self.msg(f"{n:,} name{'s' * (n != 1)} replaced by the lookup key" if n else
+                     f"Lookup labels read: {found:,} found · {secs:.1f}s")
+            self.sheet.redraw()
+
+        self.bg("Reading lookup labels", work, done, cancel=True)
+
     def _bad_cells(self, rows, new, edited) -> dict[tuple[int, int], str]:
         """Cells that would fail on the server, with the reason: every filled cell of
         a new row, and the changed cells of an edited row."""
@@ -2479,7 +3249,25 @@ class App:
                 err = cell_error(self.cols[ci], rows[gi][ci])
                 if err:
                     bad[gi, ci] = err
+        for gi, ci in [(gi, ci) for gi, _ in new for ci in range(len(self.cols))] + \
+                [(gi, ci) for gi, _, ch in edited for ci in ch]:
+            col, v = self.cols[ci], rows[gi][ci]
+            if col.big and col.of is None and v and v.strip().upper() != "NULL" and not is_formula(v) \
+                    and col.in_lookup(v) is None and v not in col.nomatch:
+                bad[gi, ci] = "Checking the lookup …"
+        for key, cells in self._formula_cells(rows, new, edited).items():
+            err = self.tab.fx_err.get(key)
+            why = (f"Formula failed: {err}" if err else "Formula: connect to evaluate it" if not self.db.cn
+                   else "Formula: not evaluated, enter it again" if self.tab.fx_hold and not self._busy
+                   else "Formula: waiting to be evaluated")
+            for cell in cells:
+                bad[cell] = why
         return bad
+
+    def _spare(self, row: list[str]) -> bool:
+        """An empty row for typing (no DB origin, nothing entered), not data."""
+        n = len(self.cols)
+        return not row[n] and not any(v.strip() for v in row[:n])
 
     def _top_up(self, rows):
         """Keep empty rows under the data, as in a spreadsheet, for typing new records."""
@@ -2774,62 +3562,462 @@ def paste_replace(e):
     return "break"
 
 
-class LabelDialog(tk.Toplevel):
-    """Which column of a referenced table to show beside its key in a dropdown."""
-    KEY, NONE = "(key only)", "(no dropdown)"
+class MessageLog(tk.Toplevel):
+    """Full text of recent errors and long messages, newest first, copyable."""
+
+    def __init__(self, app: "App"):
+        super().__init__(app.root)
+        self.title("Messages")
+        self.configure(bg=C["surface"])
+        self.transient(app.root)
+        self.geometry("760x420")
+        f = ttk.Frame(self, padding=16)
+        f.pack(fill="both", expand=True)
+        t = tk.Text(f, wrap="word", font=MONO, bg=C["surface"], fg=C["text"], relief="flat",
+                    highlightthickness=1, highlightbackground=C["line"], padx=8, pady=8)
+        t.tag_configure("err", foreground=C["error"])
+        t.tag_configure("head", foreground=C["muted"])
+        for when, sheet, text, error in reversed(app.log):
+            t.insert("end", f"{when}  {sheet}\n", "head")
+            t.insert("end", text.rstrip() + "\n\n", "err" if error else "")
+        if not app.log:
+            t.insert("end", "No errors or long messages yet.", "head")
+        t.configure(state="disabled")
+        t.pack(fill="both", expand=True)
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", pady=(12, 0))
+        ttk.Button(bar, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(bar, text="Copy all", command=lambda: (self.clipboard_clear(), self.clipboard_append(
+            t.get("1.0", "end").strip()))).pack(side="right", padx=8)
+        self.bind("<Escape>", lambda e: self.destroy())
+
+
+class LookupDialog(tk.Toplevel):
+    """Where a column's dropdown comes from: automatic (foreign key or lookup
+    file), a table you pick (key column + fields shown beside it), or none;
+    and how those fields show in the grid.
+    result: "auto", {"off": True}, {"db", "table", "key", "label": [fields]} or None.
+    show: "default" / "same" / "separate" / "off" (label display of the column)."""
+    SHOW = {"As in Settings": "default", "In the cell: id · value": "same", "In the cell: value only": "value",
+            "Own column per field": "separate", "Id only": "off"}
 
     def __init__(self, app: "App", col: "Col"):
         super().__init__(app.root)
-        self.result: str | None = None
-        self.title("Lookup label")
+        self.app, self.col, self.result = app, col, None
+        self.title(f"Lookup · {col.name}")
+        self.configure(bg=C["surface"])
+        self.transient(app.root)
+        self.resizable(False, False)
+        over = app.settings.get("lookups", {}).get(col_key(app.database, app.table, col.name))
+        src = col.src or {}
+        f = ttk.Frame(self, padding=16)
+        f.pack(fill="both")
+        self.v_mode = tk.StringVar(value="off" if over and over.get("off") else "table" if over else "auto")
+        auto = f"Automatic ({col.lookup})" if (col.lookup and not over) else \
+            f"Automatic (foreign key to {col.fk})" if col.fk else "Automatic (none found)"
+        for i, (val, text) in enumerate((("auto", auto), ("table", "From a table"), ("off", "No dropdown"))):
+            ttk.Radiobutton(f, text=text, value=val, variable=self.v_mode, command=self._mode
+                            ).grid(row=i, column=0, columnspan=2, sticky="w", pady=2)
+        form = ttk.Frame(f)
+        form.grid(row=3, column=0, columnspan=2, sticky="we", padx=(24, 0), pady=(4, 8))
+        table = src.get("table", "")
+        self.v_db = tk.StringVar(value=src.get("db") or app.database)
+        self.v_table, self.v_key = tk.StringVar(value=table), tk.StringVar(value=src.get("key", ""))
+        self.chosen = label_fields(src) if src else []  # ticked fields, in tick order
+        self.checks: dict[str, tk.BooleanVar] = {}
+        self.show = None
+        self.widgets = []
+        same = self.v_db.get().lower() == app.database.lower()
+        for r, (text, var, values) in enumerate((("Database", self.v_db, app.tab.dbs),
+                                                 ("Table", self.v_table, app._all_tables if same else []),
+                                                 ("Key", self.v_key, []))):
+            ttk.Label(form, text=text).grid(row=r, column=0, sticky="w", padx=(0, 8), pady=3)
+            cb = ttk.Combobox(form, textvariable=var, values=values, width=34,
+                              state="normal" if r < 2 else "readonly")
+            cb.grid(row=r, column=1, sticky="w", pady=3)
+            self.widgets.append(cb)
+        self.cb_db, self.cb_table, self.cb_key = self.widgets
+        self.cb_key.bind("<<ComboboxSelected>>", lambda e: self._fields())
+        ttk.Label(form, text="Show").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 3))
+        self.v_find = tk.StringVar()
+        self.e_find = ttk.Entry(form, textvariable=self.v_find, width=36)
+        self.e_find.grid(row=3, column=1, sticky="w", pady=(6, 3))
+        Hint(app, self.e_find, self.v_find, "Find a field")
+        self.v_find.trace_add("write", lambda *a: self._fields())
+        self.box = ttk.Frame(form)
+        self.box.grid(row=4, column=1, sticky="w", pady=(2, 3))
+        sub_row = ttk.Frame(form)
+        sub_row.grid(row=5, column=1, sticky="we")
+        self.l_order = ttk.Label(sub_row, style="Group.TLabel")
+        self.l_order.pack(side="left")
+        self.b_sub = ttk.Button(sub_row, text="Field lookup…", style="Tool.TButton", command=self._sub)
+        self.b_sub.pack(side="right")
+        self.subs_changed = False
+        own = app.settings.get("label_modes", {}).get(col_key(app.database, app.table, col.name))
+        self.v_show = tk.StringVar(value={v: k for k, v in self.SHOW.items()}[own or "default"])
+        ttk.Label(form, text="Fields go").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Combobox(form, textvariable=self.v_show, values=list(self.SHOW), width=34, state="readonly"
+                     ).grid(row=6, column=1, sticky="w", pady=3)
+        self._fields(col.label_fields if src else [])
+        self._tables_of = app.database if same else None
+        for ev in ("<<ComboboxSelected>>", "<Return>", "<FocusOut>"):
+            self.cb_db.bind(ev, lambda e: self._tables())
+        self.cb_table.bind("<<ComboboxSelected>>", lambda e: self._columns())
+        self.cb_table.bind("<Return>", lambda e: self._columns())
+        self.cb_table.bind("<FocusOut>", lambda e: self._columns())
+        ttk.Label(f, text="Any database on this server. Display only: the cell keeps the key.",
+                  style="Group.TLabel").grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        bar = ttk.Frame(f)
+        bar.grid(row=5, column=0, columnspan=2, sticky="we")
+        ttk.Button(bar, text="View values", command=lambda: app.lookup_view()).pack(side="left")
+        ttk.Button(bar, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(bar, text="Save", style="Primary.TButton", command=self._ok).pack(side="right", padx=8)
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._loaded = None
+        self._mode()
+        if not same:
+            self._tables()  # then its columns: one job at a time on the connection
+        elif table:
+            self._columns()
+        modal(self)
+        self.wait_window()
+
+    def _where(self) -> tuple[str, str]:
+        """(database, schema.table); a table typed as database.schema.table wins."""
+        parts = [p.strip("[] ") for p in self.v_table.get().strip().split(".")]
+        if len(parts) >= 3:
+            return parts[0], ".".join(parts[1:3])
+        return self.v_db.get().strip() or self.app.database, ".".join(parts)
+
+    def _tables(self):
+        """List the tables of the picked database."""
+        db = self.v_db.get().strip()
+        if not db or db == self._tables_of:
+            return
+        self._tables_of = db
+        dbc = self.app.db
+
+        def done(tables, secs):
+            if self.winfo_exists() and self.v_db.get().strip() == db:
+                self.cb_table.configure(values=tables)
+                if self.v_table.get() and self.v_table.get() not in tables:
+                    self.v_table.set("")
+                self.app.msg(f"{db}: {len(tables)} tables")
+                if self.v_table.get():
+                    self._columns()
+
+        self.app.bg("Reading tables", lambda: dbc.tables(db), done)
+
+    def _mode(self):
+        mode = self.v_mode.get()
+        for w in self.widgets:
+            w.state(["!disabled"] if mode == "table" else ["disabled"])
+        on = mode == "table" or (mode == "auto" and bool(self.col.src))  # fields of a foreign key too
+        for w in (*self.box.winfo_children(), self.e_find, self.b_sub):
+            w.state(["!disabled"] if on else ["disabled"])
+
+    SHOWN = 24  # fields listed at once; Find narrows a wide table
+
+    def _fields(self, names: list[str] | None = None):
+        """Checklist of the lookup table's columns (all but the key); several can be
+        ticked, shown in the order ticked. Ticked fields first, then the rest that
+        match Find, at most SHOWN."""
+        if names is not None:
+            self._names = names
+        key = self.v_key.get()
+        for w in self.box.winfo_children():
+            w.destroy()
+        self.checks = {}
+        avail = [n for n in self._names if n != key]
+        self.chosen = [n for n in self.chosen if n in avail]
+        find = self.v_find.get().strip().lower() if hasattr(self, "v_find") else ""
+        rest = [n for n in avail if n not in self.chosen and find in n.lower()]
+        hidden = max(0, len(self.chosen) + len(rest) - self.SHOWN)
+        listed = self.chosen + rest[:max(0, self.SHOWN - len(self.chosen))]
+        per_col = max(1, -(-len(listed) // 3))  # up to 3 columns of ticks
+        if hidden:
+            ttk.Label(self.box, text=f"+{hidden} more: type in Find", style="Group.TLabel"
+                      ).grid(row=per_col, column=0, columnspan=3, sticky="w")
+        for i, n in enumerate(listed):
+            v = self.checks[n] = tk.BooleanVar(value=n in self.chosen)
+            ttk.Checkbutton(self.box, text=n, variable=v, command=lambda n=n: self._tick(n)
+                            ).grid(row=i % per_col, column=i // per_col, sticky="w", padx=(0, 12))
+        if not listed:
+            ttk.Label(self.box, text="Pick a table first" if not self._names else
+                      "No field matches" if find else "No other columns",
+                      style="Group.TLabel").grid(row=0, column=0, sticky="w")
+        self._order()
+        if hasattr(self, "v_mode"):
+            self._mode()
+
+    def _sub(self):
+        """Lookup of a ticked field ("SectorID" -> the Sector table): pick the field, then
+        the same dialog. Saved now; Save or Cancel here then reloads."""
+        if not self.chosen:
+            return self.app.msg("Tick a field first", error=True)
+        field = self.chosen[0] if len(self.chosen) == 1 else self._pick_field()
+        if not field:
+            return
+        name = f"{self.col.name} ▸ {field}"
+        own = self.col.label_fields.index(field) if field in self.col.label_fields else None
+        sub = self.col.subs.get(own) if own is not None else None
+        sub = sub or Col(name, "", False, False, False, external=True)
+        dlg = LookupDialog(self.app, sub)
+        if dlg.result is not None:
+            self.app.save_lookup(name, dlg.result, dlg.show)
+            self.subs_changed = True
+            self.app.msg(f"Lookup for {name} saved")
+        self.subs_changed |= dlg.subs_changed
+        modal(self)
+
+    def _pick_field(self) -> str:
+        menu = tk.Menu(self, tearoff=0)
+        got = tk.StringVar()
+        for f in self.chosen:
+            menu.add_command(label=f, command=lambda f=f: got.set(f))
+        menu.bind("<Unmap>", lambda e: self.after(50, lambda: got.set(got.get() or "-")))
+        menu.tk_popup(self.b_sub.winfo_rootx(), self.b_sub.winfo_rooty() + self.b_sub.winfo_height())
+        self.wait_variable(got)
+        return "" if got.get() == "-" else got.get()
+
+    def _tick(self, name: str):
+        if self.checks[name].get():
+            self.chosen.append(name)
+        else:
+            self.chosen.remove(name)
+        self._order()
+
+    def _order(self):
+        self.l_order.configure(text=("Shown as: key · " + " · ".join(self.chosen)) if self.chosen
+                               else "Nothing ticked: key only")
+
+    def _columns(self):
+        """Fill Key / Shown beside from the picked table's columns."""
+        db, table = self._where()
+        if not table or (db, table) == self._loaded:
+            return
+        self._loaded = (db, table)
+        dbc = self.app.db
+
+        def work():
+            return dbc.columns(db, table)
+
+        def done(cols, secs):
+            if not self.winfo_exists():
+                return
+            names = [c.name for c in cols]
+            self.cb_key.configure(values=names)
+            if self.v_key.get() not in names:
+                pk = [c.name for c in cols if c.is_pk]
+                self.v_key.set(pk[0] if pk else self.col.name if self.col.name in names else names[0])
+            if not any(n in names for n in self.chosen):  # another table: start from the likeliest field
+                texts = [c.name for c in cols if c.type in TEXT_TYPES and c.name != self.v_key.get()]
+                self.chosen = [g] if (g := guess_label(texts, table)) else []
+            self._fields(names)
+            self.app.msg(f"{db}.{table}: {len(names)} columns")
+
+        self.app.bg("Reading lookup table", work, done)
+
+    def _ok(self):
+        mode, src = self.v_mode.get(), self.col.src
+        if mode == "auto" and src and self.chosen != label_fields(src):  # other fields of the same table
+            self.result = {**src, "label": list(self.chosen)}
+        elif mode == "auto":
+            self.result = "auto"
+        elif mode == "off":
+            self.result = {"off": True}
+        else:
+            db, table = self._where()
+            if not table or not self.v_key.get():
+                return self.app.msg("Pick a table and its key column", error=True)
+            self.result = {"db": db, "table": table, "key": self.v_key.get(), "label": list(self.chosen)}
+        self.show = self.SHOW[self.v_show.get()]
+        self.destroy()
+
+
+class LabelModeDialog(tk.Toplevel):
+    """Per-column label display: Settings default, same column, separate, off."""
+
+    def __init__(self, app: "App", col: "Col"):
+        super().__init__(app.root)
+        self.result = None
+        self.title(f"Label display · {col.name}")
         self.configure(bg=C["surface"])
         self.transient(app.root)
         self.resizable(False, False)
         f = ttk.Frame(self, padding=16)
         f.pack(fill="both")
-        ttk.Label(f, text=f"{col.name} refers to {col.fk}.\n"
-                         f"Which column should the dropdown show beside the key?",
-                  justify="left").pack(anchor="w", pady=(0, 8))
-        current = (self.NONE if col.choices is None else col.label_col or self.KEY)
-        self.v = tk.StringVar(value=current)
-        cb = ttk.Combobox(f, textvariable=self.v, values=[*col.label_options, self.KEY, self.NONE],
-                          state="readonly", width=36)
-        cb.pack(anchor="w")
-        ttk.Label(f, text="Remembered for this table. Settings can reset it.",
-                  style="Group.TLabel").pack(anchor="w", pady=(4, 12))
+        own = app.settings.get("label_modes", {}).get(col_key(app.database, app.table, col.name))
+        self.v = tk.StringVar(value=own or "default")
+        default = {v: k for k, v in LABEL_MODES.items()}[app.settings.get("label_display", "same")]
+        for val, text in (("default", f"As in Settings ({default.lower()})"), *(
+                (v, k) for k, v in LABEL_MODES.items())):
+            ttk.Radiobutton(f, text=text, value=val, variable=self.v).pack(anchor="w", pady=2)
+        ttk.Label(f, text="Display only: the database always gets the id.", style="Group.TLabel"
+                  ).pack(anchor="w", pady=(8, 12))
         bar = ttk.Frame(f)
         bar.pack(fill="x")
         ttk.Button(bar, text="Cancel", command=self.destroy).pack(side="right")
-        ttk.Button(bar, text="OK", style="Primary.TButton", command=self._ok).pack(side="right", padx=8)
+        ttk.Button(bar, text="Apply", style="Primary.TButton", command=self._ok).pack(side="right", padx=8)
         self.bind("<Return>", lambda e: self._ok())
         self.bind("<Escape>", lambda e: self.destroy())
         modal(self)
-        cb.focus_set()
         self.wait_window()
 
     def _ok(self):
-        v = self.v.get()
-        self.result = {self.KEY: "", self.NONE: NO_LOOKUP}.get(v, v)
+        self.result = self.v.get()
         self.destroy()
 
 
-class _NoTooltip(tk.Toplevel):
-    """Stand-in for tksheet's cell / header / index tooltip windows. tksheet
-    builds three per sheet up front and laying them out costs about a second
-    per sheet; this app never turns tksheet tooltips or notes on."""
-    cell_readonly = note_readonly = True
+class LookupView(tk.Toplevel):
+    """Every allowed value of a lookup column with its label, searchable.
+    Use (or double-click) writes the id into the selected cells."""
 
-    def __init__(self, parent, **_):
-        super().__init__(parent)
-        self.withdraw()
-        self.overrideredirect(True)
+    def __init__(self, app: "App", col: "Col"):
+        super().__init__(app.root)
+        self.app, self.col = app, col
+        self.title(f"Lookup values · {col.name}")
+        self.configure(bg=C["surface"])
+        self.transient(app.root)
+        f = ttk.Frame(self, padding=16)
+        f.pack(fill="both", expand=True)
+        self.l_head = ttk.Label(f, text=f"{len(col.choices):,} values from {col.lookup}" if not col.big else
+                                f"{col.lookup} · searched on the server, first 200 shown", style="Group.TLabel")
+        self.l_head.pack(anchor="w")
+        self.v_find = tk.StringVar()
+        e = ttk.Entry(f, textvariable=self.v_find)
+        e.pack(fill="x", pady=(8, 8))
+        Hint(app, e, self.v_find, "Search id or label")
+        box = ttk.Frame(f)
+        box.pack(fill="both", expand=True)
+        fields = col.label_fields or ["label"]
+        names = ["id", *(f"f{i}" for i in range(len(fields)))]
+        self.tree = ttk.Treeview(box, columns=names, show="headings", selectmode="browse")
+        self.tree.heading("id", text="Id", anchor="w")
+        self.tree.column("id", width=90, stretch=False)
+        for name, field in zip(names[1:], fields):
+            self.tree.heading(name, text=field, anchor="w")
+            self.tree.column(name, width=max(120, 360 // len(fields)))
+        self.geometry(f"{min(1000, 200 + 180 * len(fields))}x560")
+        sb = ttk.Scrollbar(box, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.rows = [(k, *col.key_fields.get(k, ("",) * len(fields))) for k in
+                     (col.picked.get(e, e) for e in col.choice_list)]
+        self._after = None
+        self.v_find.trace_add("write", lambda *a: self._search() if col.big else self._fill())
+        self.tree.bind("<Double-Button-1>", lambda ev: self._use())
+        self.tree.bind("<Return>", lambda ev: self._use())
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", pady=(12, 0))
+        ttk.Button(bar, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(bar, text="Use for selected cells", style="Primary.TButton", command=self._use
+                   ).pack(side="right", padx=8)
+        self.bind("<Escape>", lambda ev: self.destroy())
+        if col.big:
+            self._ask()
+        else:
+            self._fill()
+        e.focus_set()
 
-    def reset(self, *a, **k):
-        pass
+    def _search(self):
+        """Big lookup: ask the server once typing pauses."""
+        if self._after:
+            self.after_cancel(self._after)
+        self._after = self.after(300, self._ask)
+
+    def _ask(self):
+        self._after = None
+        if self.app._busy:  # the connection is in use: try again shortly
+            self._after = self.after(300, self._ask)
+            return
+        text, db, col = self.v_find.get().strip(), self.app.db, self.col
+
+        def done(rows, secs):
+            if not self.winfo_exists() or self.v_find.get().strip() != text:
+                return
+            self.rows = [tuple("" if v is None else str(v) for v in r) for r in rows]
+            self.l_head.configure(text=f"{col.lookup} · {len(rows):,} shown"
+                                       + (" (first 200: type to narrow)" if len(rows) >= 200 else ""))
+            self.app.msg(f"Lookup search: {len(rows):,} rows · {secs:.1f}s")
+            self._fill()
+
+        self.app.bg("Searching lookup", lambda: db.big_search(col, text), done)
+
+    def _fill(self):
+        if self.col.big:  # already filtered by the server
+            self.tree.delete(*self.tree.get_children())
+            for row in self.rows:
+                if not self.tree.exists(row[0]):
+                    self.tree.insert("", "end", iid=row[0], values=row)
+            return
+        t = self.v_find.get().strip().lower()
+        self.tree.delete(*self.tree.get_children())
+        for row in self.rows:
+            if not t or any(t in v.lower() for v in row):
+                self.tree.insert("", "end", iid=row[0], values=row)
+
+    def _use(self):
+        sel = self.tree.selection()
+        if sel:
+            if self.col.big:  # known now: no server round trip to label it
+                vals = tuple(self.tree.item(sel[0], "values")[1:])
+                self.col.key_fields[sel[0]] = vals
+                self.col.key_label[sel[0]] = LABEL_SEP.join(v for v in vals if v)
+            self.app.put_value(self.col, sel[0])
 
 
-for _m in (_tks_mt, _tks_ch, _tks_ri):
-    _m.Tooltip = _NoTooltip
+class ColumnFind(tk.Toplevel):
+    """Ctrl+Shift+F: type part of a column name, Enter or double-click selects it."""
+
+    def __init__(self, app: "App"):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Find column")
+        self.configure(bg=C["surface"])
+        self.transient(app.root)
+        self.geometry("360x420")
+        f = ttk.Frame(self, padding=12)
+        f.pack(fill="both", expand=True)
+        self.v = tk.StringVar()
+        e = ttk.Entry(f, textvariable=self.v)
+        e.pack(fill="x")
+        Hint(app, e, self.v, "Column name")
+        self.lb = tk.Listbox(f, activestyle="none", borderwidth=0, highlightthickness=0, font=FONT,
+                             bg=C["surface"], fg=C["text"], selectbackground=C["accent_soft"],
+                             selectforeground=C["text"])
+        self.lb.pack(fill="both", expand=True, pady=(8, 0))
+        self.v.trace_add("write", lambda *a: self._fill())
+        for w in (e, self.lb):
+            w.bind("<Return>", lambda ev: self._go())
+            w.bind("<Escape>", lambda ev: self.destroy())
+        e.bind("<Down>", lambda ev: (self.lb.focus_set(), self.lb.selection_set(0)))
+        self.lb.bind("<Double-Button-1>", lambda ev: self._go())
+        self._fill()
+        e.focus_set()
+
+    def _fill(self):
+        t = self.v.get().strip().lower()
+        self.hits = [i for i, c in enumerate(self.app.cols) if t in c.label.lower()]
+        self.hits.sort(key=lambda i: not self.app.cols[i].label.lower().startswith(t))
+        self.lb.delete(0, "end")
+        for i in self.hits:
+            self.lb.insert("end", f"{num2alpha(i)}   {self.app.cols[i].label}")
+        if self.hits:
+            self.lb.selection_set(0)
+
+    def _go(self):
+        sel = self.lb.curselection()
+        if not self.hits:
+            return
+        c = self.hits[sel[0] if sel else 0]
+        sheet = self.app.sheet
+        sheet.select_column(c)
+        sheet.see(0, c)
+        self.app.l_stats.configure(text=col_info(self.app.cols[c]))
+        self.destroy()
+        sheet.focus_set()
 
 
 def modal(win: tk.Toplevel):
@@ -3003,18 +4191,40 @@ class SettingsDialog(tk.Toplevel):
                          "dropdown on their own. Applies on the next Load or Run.",
                   style="Group.TLabel", justify="left").grid(row=4, column=0, columnspan=2,
                                                             sticky="w", pady=(2, 12))
+        ttk.Label(f, text="Lookup labels", style="Group.TLabel").grid(row=8, column=0, columnspan=2, sticky="w")
+        for r, (text, key, options) in enumerate((("Show", "label_display", LABEL_MODES),
+                                                  ("Format", "label_format", LABEL_FORMATS),
+                                                  ("Not in lookup", "mismatch", MISMATCH)), start=9):
+            ttk.Label(f, text=text).grid(row=r, column=0, sticky="w", padx=(0, 12), pady=3)
+            names = {v: k for k, v in options.items()}
+            var = tk.StringVar(value=names.get(app.settings.get(key), next(iter(options))))
+            cb = ttk.Combobox(f, textvariable=var, values=list(options), width=22, state="readonly")
+            cb.grid(row=r, column=1, sticky="w", pady=3)
+            cb.bind("<<ComboboxSelected>>",
+                    lambda e, key=key, var=var, options=options: self._label_pref(app, key, options[var.get()]))
+        ttk.Label(f, text="Display only: the database always gets the id. Per column: header menu ->\n"
+                         "Label display…", style="Group.TLabel", justify="left"
+                  ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(2, 12))
         self.v_ime = tk.BooleanVar(value=app.settings.get("ime", False))
         ttk.Checkbutton(f, text="Input method (IME) for composed characters, applies on restart",
                         variable=self.v_ime, command=lambda: self._ime(app)
                         ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 12))
-        ttk.Button(f, text="Forget lookup label choices",
-                   command=lambda: (app.settings.pop("fk_labels", None), save_settings(app.settings),
-                                    app.msg("Lookup labels reset; applies on the next Load"))
+        ttk.Button(f, text="Reset lookups to automatic",
+                   command=lambda: (app.settings.pop("fk_labels", None), app.settings.pop("lookups", None),
+                                    save_settings(app.settings),
+                                    app.msg("Lookups reset to automatic; applies on the next Load"))
                    ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 12))
-        ttk.Label(f, text=f"Version {VERSION}", style="Group.TLabel").grid(row=7, column=0, sticky="w")
-        ttk.Button(f, text="Close", command=self.destroy).grid(row=7, column=1, sticky="e")
+        ttk.Label(f, text=f"Version {VERSION}", style="Group.TLabel").grid(row=13, column=0, sticky="w")
+        ttk.Button(f, text="Close", command=self.destroy).grid(row=13, column=1, sticky="e")
         self.bind("<Escape>", lambda e: self.destroy())
         modal(self)
+
+    def _label_pref(self, app: "App", key: str, value: str):
+        app.settings[key] = value
+        save_settings(app.settings)
+        for t in app.tabs:  # every open sheet redraws with the new look
+            if t.cols:
+                app._in(t, app._relabel)
 
     def _ime(self, app: "App"):
         app.settings["ime"] = self.v_ime.get()
@@ -3191,8 +4401,8 @@ class FilterDialog(tk.Toplevel):
         self.configure(bg=C["surface"])
         self.transient(app.root)
         spec = app.filters.get(col.label, {})
-        data = app.sheet.get_sheet_data()
-        values = sorted({("" if r[c] is None else str(r[c])) or excel_ops.BLANK for r in data},
+        data = [r for r in app._rows() if not app._spare(r)]
+        values = sorted({r[c] or excel_ops.BLANK for r in data},
                         key=lambda v: (v == excel_ops.BLANK, v.lower()))
         self.values = values[:self.MAX_VALUES]
 

@@ -96,10 +96,90 @@ def tls_context() -> ssl.SSLContext:
 TLS = tls_context()
 
 
-def get(url: str, timeout: float = TIMEOUT) -> bytes:
+def get(url: str, timeout: float = TIMEOUT, progress=None) -> bytes:
+    """GET `url`. `progress(done, total)` is called as it arrives (total 0 = unknown)."""
     req = urllib.request.Request(url, headers={"User-Agent": "AbsoluteQuery-launcher"})
     with urllib.request.urlopen(req, timeout=timeout, context=TLS) as r:
-        return r.read()
+        if progress is None:
+            return r.read()
+        total, parts, done = int(r.headers.get("Content-Length") or 0), [], 0
+        while chunk := r.read(256 * 1024):
+            parts.append(chunk)
+            done += len(chunk)
+            progress(done, total)
+        return b"".join(parts)
+
+
+class Progress:
+    """Start-up window while an update downloads. Opens only when the update work is
+    still running after SHOW_AFTER seconds, so a normal start shows nothing. The work
+    runs in a thread and reports here; Tk is only touched from the main thread."""
+    SHOW_AFTER = 0.4
+
+    def __init__(self):
+        self.text, self.done, self.total = "Checking for updates", 0, 0
+
+    def stage(self, text: str) -> None:
+        self.text, self.done, self.total = text, 0, 0
+
+    def bytes(self, done: int, total: int) -> None:
+        self.done, self.total = done, total
+
+    def run(self, work: threading.Thread) -> None:
+        work.join(self.SHOW_AFTER)
+        if not work.is_alive():
+            return
+        try:
+            self._window(work)
+        except Exception:  # noqa: BLE001 - no display / no Tk: just wait
+            work.join()
+
+    def _window(self, work: threading.Thread) -> None:
+        import tkinter as tk
+        dark = _dark_theme()
+        bg, fg, muted, track, bar = (("#1e1e1e", "#e6e6e6", "#9a9a9a", "#333333", "#4aa37a") if dark else
+                                     ("#ffffff", "#1f1f1f", "#6b6b6b", "#e6e6e6", "#1e7a4f"))
+        root = tk.Tk()
+        root.title("AbsoluteQuery")
+        root.configure(bg=bg)
+        root.resizable(False, False)
+        w, h = 380, 104
+        root.geometry(f"{w}x{h}+{(root.winfo_screenwidth() - w) // 2}+{(root.winfo_screenheight() - h) // 3}")
+        font = ("Segoe UI", 10) if os.name == "nt" else ("Sans", 10)
+        stage = tk.Label(root, bg=bg, fg=fg, font=font, anchor="w")  # the window title names the app
+        stage.place(x=24, y=24, width=w - 48)
+        trough = tk.Frame(root, bg=track)  # plain frames: ttk bars ignore colours on some themes
+        trough.place(x=24, y=52, width=w - 48, height=4)
+        fill = tk.Frame(trough, bg=bar)
+        detail = tk.Label(root, bg=bg, fg=muted, font=(font[0], 9), anchor="w")
+        detail.place(x=24, y=68, width=w - 48)
+        root.protocol("WM_DELETE_WINDOW", lambda: None)  # the update finishes on its own
+        step = [0]
+
+        def tick():
+            if not work.is_alive():
+                root.destroy()
+                return
+            stage.configure(text=self.text)
+            if self.total:  # size known: how much of it has arrived
+                fill.place(x=0, y=0, relheight=1, relwidth=min(1.0, self.done / self.total))
+                detail.configure(text=f"{self.done / 1e6:.1f} of {self.total / 1e6:.1f} MB")
+            else:  # size unknown: a short segment sweeps across
+                step[0] = (step[0] + 1) % 40
+                fill.place(relx=step[0] / 40 * 1.25 - 0.25, y=0, relheight=1, relwidth=0.25)
+                detail.configure(text=f"{self.done / 1e6:.1f} MB" if self.done else "")
+            root.after(40, tick)
+
+        tick()
+        root.mainloop()
+
+
+def _dark_theme() -> bool:
+    """The app's own theme setting, so this window matches what opens next."""
+    try:
+        return json.loads((Path.home() / ".absolutequery.json").read_text()).get("theme") == "Dark"
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 def latest_sha(repo: str, branch: str) -> str:
@@ -113,12 +193,14 @@ def latest_sha(repo: str, branch: str) -> str:
     return m.group(1)
 
 
-def download(repo: str, sha: str) -> Path:
+def download(repo: str, sha: str, ui: Progress) -> Path:
     """Unpack the repo at `sha` into versions/<sha>; returns the folder holding ENTRY.py."""
     dest = VERSIONS / sha[:12]
     if (dest / f"{ENTRY}.py").is_file():
         return dest
-    blob = get(f"{repo.rstrip('/')}/archive/{sha}.zip", DOWNLOAD_TIMEOUT)
+    ui.stage("Downloading the latest version")
+    blob = get(f"{repo.rstrip('/')}/archive/{sha}.zip", DOWNLOAD_TIMEOUT, ui.bytes)
+    ui.stage("Installing the latest version")
     tmp = VERSIONS / f".{sha[:12]}.part"
     shutil.rmtree(tmp, ignore_errors=True)
     with zipfile.ZipFile(io.BytesIO(blob)) as z:
@@ -147,12 +229,12 @@ def build_id() -> str:
         return ""
 
 
-def update_program(state: dict) -> None:
-    """Replace this program with the release's when that was built differently,
-    then restart. Each new build is tried once, so a bad release cannot loop."""
+def update_program(state: dict, ui: Progress) -> bool:
+    """Replace this program with the release's when that was built differently.
+    True: replaced, restart it. Each new build is tried once, so a bad release cannot loop."""
     mine = build_id()
     if not mine:
-        return
+        return False
     exe = Path(sys.executable)
     for old in exe.parent.glob(f"{exe.stem}.old*"):  # left by a previous swap on Windows
         try:
@@ -164,10 +246,12 @@ def update_program(state: dict) -> None:
     try:
         latest = get(f"{base}/{ASSET}.build").decode().strip()
         if not latest or latest == mine or state.get("program_tried") == latest:
-            return
+            return False
         state["program_tried"] = latest
         write_state(state)
-        blob = get(f"{base}/{ASSET}", DOWNLOAD_TIMEOUT)
+        ui.stage("Downloading a new program version")
+        blob = get(f"{base}/{ASSET}", DOWNLOAD_TIMEOUT, ui.bytes)
+        ui.stage("Installing, then restarting")
         if len(blob) < 1_000_000:
             raise RuntimeError(f"download too small ({len(blob)} bytes)")
         new = exe.with_name(exe.name + ".new")
@@ -179,8 +263,13 @@ def update_program(state: dict) -> None:
         log(f"program updated {mine} -> {latest}, restarting")
     except Exception as e:  # noqa: BLE001 - offline, no release yet, read-only folder: carry on
         log(f"program update skipped: {e!r}")
-        return
-    # fresh start of the new program (not inside this one's unpacked files)
+        return False
+    return True
+
+
+def restart() -> None:
+    """Fresh start of the new program (not inside this one's unpacked files)."""
+    exe = Path(sys.executable)
     subprocess.Popen([str(exe), *sys.argv[1:]], env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"})
     sys.exit(0)
 
@@ -211,13 +300,13 @@ def check_code():
     return result
 
 
-def update(state: dict, latest) -> None:
+def update(state: dict, latest, ui: Progress) -> None:
     repo = os.environ.get("ABSOLUTEQUERY_REPO", REPO_URL)
     try:
         sha = latest()
         if sha == state.get("sha") and Path(state.get("dir", "")).is_dir():
             return
-        d = download(repo, sha)
+        d = download(repo, sha, ui)
         state["previous"] = state.get("dir")
         state.update(sha=sha, dir=str(d))
         write_state(state)
@@ -267,8 +356,19 @@ def main() -> None:
     VERSIONS.mkdir(exist_ok=True)
     state = read_state()
     latest = check_code()  # both checks at once: one network wait, not two
-    update_program(state)
-    update(state, latest)
+    ui, out = Progress(), {}
+
+    def work():
+        out["restart"] = update_program(state, ui)
+        if not out["restart"]:
+            update(state, latest, ui)
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    ui.run(worker)  # a window only if this takes a while
+    worker.join()
+    if out.get("restart"):
+        restart()
     tries = [(Path(d).name, d) for d in (state.get("dir"), state.get("previous")) if d]
     for label, folder in tries + [("bundled", str(bundled()))]:
         if not folder or not (Path(folder) / f"{ENTRY}.py").is_file():

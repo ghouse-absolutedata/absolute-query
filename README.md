@@ -41,10 +41,19 @@ Windows and Linux.
 Foreign keys get a dropdown on their own, with a text column of the referenced
 table shown beside each key (`3 · ISIN`). The cell keeps only the key. The label
 column is picked automatically: a `…Name` column first, then `…Description`, then
-`…Code`. If the pick is wrong, right-click the column header and choose *Lookup
-label…*. From there you can pick another column, show the key only, or turn the
-dropdown off. The choice is remembered, and *Forget lookup label choices* in
-Settings resets it.
+`…Code`.
+
+Right-click any column header and choose **Lookup…** to set or correct a lookup:
+- **From a table**: pick any table (`database.schema.table` works too), its key
+  column, and the column shown beside the key. This works for columns with no
+  foreign key as well.
+- **No dropdown**.
+- **Automatic**: back to the foreign key or the lookup file.
+
+The choice is remembered per column. *Reset lookups to automatic* in Settings
+clears all of them. **View lookup values…** in the same menu lists every id with
+its label and has a search box. *Use for selected cells* writes the chosen id into
+the selected cells.
 
 You can type a key, a label, or part of a label in the cell or the fx bar. The
 dropdown jumps to the matching entry, and Enter stores its key: `valoren` becomes
