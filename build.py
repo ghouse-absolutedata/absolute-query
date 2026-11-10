@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-APP_FILES = ["absolute_query.py", "connections.py", "excel_ops.py", "icons.py"]
+APP_FILES = ["absolute_query.py", "connections.py", "excel_ops.py", "icons.py", "sql_assist.py"]
 PROGRAM_FILES = ["launcher.py", "build.py", "requirements.txt"]  # define the build id
 LOCAL = {Path(f).stem for f in APP_FILES}
 # packages pulled in whole (plugins / backends are loaded dynamically)

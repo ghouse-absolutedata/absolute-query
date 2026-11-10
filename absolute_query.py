@@ -19,6 +19,12 @@ Reads
            result, else the first table whose key columns are all selected.
            Other tables' and expression columns are read-only, never written.
            Updates need the table key in the result.
+           Typing suggests what fits: tables after FROM / JOIN, columns after
+           alias. or in SELECT / WHERE / ON / BY (type, PK, FK shown), keywords
+           and functions; after JOIN also ready joins from foreign keys
+           (dbo.Customer c ON c.Id = o.CustomerId). Ctrl+Space opens the list,
+           Tab / Enter picks, Esc closes. Metadata loads once per database on a
+           second read-only connection, so typing never waits on a query.
 
   Every read runs READ UNCOMMITTED (the same as WITH (NOLOCK) on every table)
   in its own transaction, which is committed. Rows stream in chunks: the status
@@ -34,8 +40,11 @@ Writes
   nothing is committed.
 
 Audit columns (matched case-insensitively, only when present on the table)
-  insert   CreatedDate = GETDATE(), CreatedBy = OS login user
-  update   ModifiedDate = GETDATE(), ModifiedBy = OS login user
+  Editable like any column; a value you type is written as typed. Left alone
+  (Settings -> Fill audit columns, on by default), the app fills:
+  insert   blank CreatedDate = GETDATE(), CreatedBy = user name
+  update   ModifiedDate = GETDATE(), ModifiedBy = user name, unless edited
+  User name: Settings, else the OS login user.
 
 Types, keys and lookups
   Typed values must fit the column type (number, date as YYYY-MM-DD, length,
@@ -69,7 +78,10 @@ Dry run
 
 Settings (gear icon in the title bar, saved to ~/.absolutequery.json)
   Review before push   Update shows every changed cell as old -> new, Insert shows
-                       the new rows; nothing is sent until confirmed
+                       the new rows; tab SQL has the same change as a readable
+                       script (SELECT before, the INSERT / UPDATE per row, SELECT
+                       after), tab Executed the exact statements and parameters
+                       sent; nothing is sent until confirmed
   Theme                Light / Dark
   Lookup file          allowed values per column, see Types, keys and lookups
 
@@ -120,6 +132,7 @@ from tksheet import column_headers as _tks_ch, main_table as _tks_mt, row_index 
 
 import connections as conns
 import excel_ops
+import sql_assist
 from icons import ICONS
 
 APP_DIR = Path(__file__).resolve().parent
@@ -136,6 +149,7 @@ CREATED_BY = {"createdby", "created_by"}
 MODIFIED_DATE = {"modifieddate", "modified_date", "modifiedon", "modified_on", "updateddate",
                  "updated_date", "updatedon", "updated_at", "lastmodified", "lastmodifieddate"}
 MODIFIED_BY = {"modifiedby", "modified_by", "updatedby", "updated_by"}
+INSERT_AUTO, UPDATE_AUTO = ("cdate", "cby"), ("mdate", "mby")  # filled when left alone
 
 # spreadsheet palettes: grey chrome, one green accent, standard sheet fills
 LIGHT = {
@@ -165,7 +179,8 @@ SETTINGS_FILE = Path.home() / ".absolutequery.json"
 
 def load_settings() -> dict:
     s = {"theme": "Light", "review": True, "lookup_file": "", "ime": False,
-         "label_display": "same", "label_format": "{id} · {label}", "mismatch": "both"}
+         "label_display": "same", "label_format": "{id} · {label}", "mismatch": "both",
+         "audit_fill": True, "audit_user": ""}
     try:
         s.update(json.loads(SETTINGS_FILE.read_text()))
     except (OSError, ValueError):
@@ -467,6 +482,57 @@ class Db:
         self.cn.commit()
         return rows
 
+    # SQL box suggestions (run on sql_assist's own connection) ---------------
+    def sql_objects(self, database: str) -> list[tuple[str, str, str]]:
+        """[(schema, name, "table" | "view")] of the database."""
+        c = self.cur(database)
+        rows = [(r[0], r[1], r[2]) for r in c.execute(
+            "SELECT s.name, o.name, CASE o.type WHEN 'V' THEN 'view' ELSE 'table' END "
+            "FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id "
+            "WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 ORDER BY s.name, o.name")]
+        self.cn.commit()
+        return rows
+
+    def sql_columns(self, database: str, table: str) -> tuple[list[tuple], list[tuple]]:
+        """(columns [(name, type text, is_pk, "schema.table.col" it references)],
+        foreign keys from or to the table [(parent, [(parent col, ref col)], ref)])."""
+        schema, name = split_table(table)
+        obj = f"{q(schema)}.{q(name)}"
+        c = self.cur(database)
+        rows = c.execute("""
+            SELECT c.name, TYPE_NAME(c.user_type_id), c.max_length, c.precision, c.scale,
+                   CASE WHEN EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic
+                                     ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+                                     WHERE i.object_id = c.object_id AND i.is_primary_key = 1
+                                       AND ic.column_id = c.column_id) THEN 1 ELSE 0 END
+            FROM sys.columns c WHERE c.object_id = OBJECT_ID(?) ORDER BY c.column_id""", obj).fetchall()
+        fks = c.execute("""
+            SELECT k.constraint_object_id,
+                   OBJECT_SCHEMA_NAME(k.parent_object_id) + '.' + OBJECT_NAME(k.parent_object_id),
+                   COL_NAME(k.parent_object_id, k.parent_column_id),
+                   OBJECT_SCHEMA_NAME(k.referenced_object_id) + '.' + OBJECT_NAME(k.referenced_object_id),
+                   COL_NAME(k.referenced_object_id, k.referenced_column_id)
+            FROM sys.foreign_key_columns k
+            WHERE k.parent_object_id = OBJECT_ID(?) OR k.referenced_object_id = OBJECT_ID(?)
+            ORDER BY k.constraint_object_id, k.constraint_column_id""", obj, obj).fetchall()
+        self.cn.commit()
+        joins: dict[int, list] = {}
+        for fid, parent, pcol, ref, rcol in fks:
+            joins.setdefault(fid, [parent, [], ref])[1].append((pcol, rcol))
+        here = f"{schema}.{name}".lower()
+        single = {pairs[0][0]: f"{ref}.{pairs[0][1]}" for parent, pairs, ref in joins.values()
+                  if parent.lower() == here and len(pairs) == 1}
+        cols = []
+        for nm, ty, ml, prec, scale, pk in rows:
+            if ty in ("varchar", "char", "varbinary", "binary", "nvarchar", "nchar"):
+                ty += f"({'max' if ml == -1 else ml // 2 if ty.startswith('n') else ml})"
+            elif ty in ("decimal", "numeric"):
+                ty += f"({prec},{scale})"
+            elif ty in ("datetime2", "time", "datetimeoffset") and scale != 7:
+                ty += f"({scale})"
+            cols.append((nm, ty, bool(pk), single.get(nm, "")))
+        return cols, [tuple(v) for v in joins.values()]
+
     def columns(self, database: str, table: str) -> list[Col]:
         schema, name = split_table(table)
         c = self.cur(database)
@@ -699,6 +765,9 @@ class Db:
         keys = [q(c.name) for c in cols if c.is_pk]
         if keys:
             sql += " ORDER BY " + ", ".join(keys)
+            if where.strip():  # TOP + ORDER BY key makes the optimizer scan the whole table in key
+                # order hoping to find matches early, instead of seeking the filter's index
+                sql += " OPTION (USE HINT('DISABLE_OPTIMIZER_ROWGOAL'))"
         return self._read(database, sql, top=top)[1]
 
     def sources(self, database, sql: str) -> list[tuple] | None:
@@ -730,15 +799,26 @@ class Db:
     # writes ---------------------------------------------------------------
     def write(self, database, steps, user: str, dry_run=False) -> int:
         """Run every step in ONE transaction, commit at the end (rollback on dry run).
-        step = (sql, payloads, expect_exact); sql takes params (user, json batch),
-        payloads = [(grid_row, json_obj)]. Returns affected rows."""
+        step = (sql, payloads, check); sql takes params (user, json batch),
+        payloads = [(grid_row, json_obj)]. check: None, or SQL taking the json batch
+        and returning (index, matches) for every row whose key does not match
+        exactly one table row; it locks the matched rows so the update sees the
+        same ones. Any such row stops the whole push. Returns affected rows."""
         c = self.cur(database, write=True)
         total = 0
         self.notes = []
         try:
-            for sql, payloads, exact in steps:
+            for sql, payloads, check in steps:
                 for i in range(0, len(payloads), BATCH):
                     chunk = payloads[i:i + BATCH]
+                    if check:
+                        bad = c.execute(check, json.dumps([p for _, p in chunk], ensure_ascii=False)
+                                        ).fetchall()
+                        if bad:
+                            j, n = bad[0]
+                            more = f" ({len(bad) - 1:,} more rows like it)" if len(bad) > 1 else ""
+                            raise RowError(chunk[j][0], f"Key matches {n} rows in the table, expected 1"
+                                           f"{more}. Nothing was written.")
                     try:
                         c.execute(sql, user, json.dumps([p for _, p in chunk], ensure_ascii=False))
                     except pyodbc.Error as e:
@@ -746,7 +826,7 @@ class Db:
                         raise self._locate(database, sql, chunk, user, e)
                     n = c.rowcount
                     self.notes += server_notes(c)
-                    if exact and n != len(chunk):
+                    if check and n != len(chunk):
                         raise RowError(None, f"Expected {len(chunk)} rows affected, got {n}. "
                                              "Key is not unique or rows changed on the server.")
                     total += n if n >= 0 else len(chunk)
@@ -776,6 +856,13 @@ class Db:
         return RowError(None, clean_err(err))
 
 
+def _meta_conn(args) -> "Db":
+    """Separate connection for SQL box suggestions (sql_assist worker thread)."""
+    db = Db()
+    db.connect(*args)
+    return db
+
+
 def server_notes(c: pyodbc.Cursor) -> list[str]:
     """Informational messages the statement produced (PRINT, RAISERROR below
     severity 11, trigger output), cleaned like errors."""
@@ -803,44 +890,185 @@ def with_clause(n: int, prefix: str) -> str:
 DECL = "DECLARE @u nvarchar(128) = ?; "
 
 
-def build_insert(table, cols: list[Col], table_cols: list[Col]) -> tuple[str, list[Col]]:
+def audit_auto(c: Col, kinds: tuple[str, ...]) -> str | None:
+    """What the app fills an audit column of `kinds` with: GETDATE() or the user (@u)."""
+    if c.readonly or c.audit not in kinds:
+        return None
+    return "GETDATE()" if c.audit in ("cdate", "mdate") else "@u"
+
+
+def insert_audit(table_cols: list[Col], shown: list[Col], fill: bool) -> list[tuple[str, str]]:
+    """(column, value) an insert adds for CreatedDate / CreatedBy the grid does not
+    show. Shown ones are filled per row when left blank (see build_insert)."""
+    names = {c.name.lower() for c in shown}
+    return [(q(c.name), audit_auto(c, INSERT_AUTO)) for c in table_cols
+            if fill and c.name.lower() not in names and audit_auto(c, INSERT_AUTO)]
+
+
+def update_audit(table_cols: list[Col], changed: list[Col], fill: bool) -> list[str]:
+    """SET items an update adds: ModifiedDate / ModifiedBy, unless edited by hand."""
+    names = {c.name for c in changed}
+    return [f"t.{q(c.name)} = {audit_auto(c, UPDATE_AUTO)}" for c in table_cols
+            if fill and c.name not in names and audit_auto(c, UPDATE_AUTO)]
+
+
+def build_insert(table, cols: list[Col], table_cols: list[Col], fill: bool) -> tuple[str, list[Col]]:
     """cols = grid columns, table_cols = all table columns (audit fields are set even
     when the grid does not show them). JSON object keys v0..vn follow data_cols."""
     schema, name = split_table(table)
     data_cols, seen = [], set()
     for c in cols:  # a column shown twice is inserted once
-        if not c.readonly and not c.scratch and c.audit is None and c.name.lower() not in seen:
+        if not c.readonly and not c.scratch and c.name.lower() not in seen:
             seen.add(c.name.lower())
             data_cols.append(c)
     tgt = [q(c.name) for c in data_cols]
-    src = [f"j.[v{i}]" for i in range(len(data_cols))]
-    for c in table_cols:
-        if c.readonly:
-            continue
-        if c.audit == "cdate":
-            tgt.append(q(c.name)); src.append("GETDATE()")
-        elif c.audit == "cby":
-            tgt.append(q(c.name)); src.append("@u")
+    src = []
+    for i, c in enumerate(data_cols):  # a blank audit cell gets the automatic value
+        auto = fill and audit_auto(c, INSERT_AUTO)
+        src.append(f"COALESCE(j.[v{i}], {auto})" if auto else f"j.[v{i}]")
+    for col, expr in insert_audit(table_cols, data_cols, fill):
+        tgt.append(col); src.append(expr)
     sql = (DECL + f"INSERT INTO {q(schema)}.{q(name)} ({', '.join(tgt)}) "
            f"SELECT {', '.join(src)} FROM OPENJSON(?) WITH ({with_clause(len(data_cols), 'v')}) j")
     return sql, data_cols
 
 
-def build_update(table, table_cols: list[Col], keys: list[Col], changed: list[Col]) -> str:
+def build_update(table, table_cols: list[Col], keys: list[Col], changed: list[Col], fill: bool) -> str:
     schema, name = split_table(table)
-    sets = [f"t.{q(c.name)} = j.[v{i}]" for i, c in enumerate(changed)]
-    changed_names = {c.name for c in changed}
-    for c in table_cols:
-        if c.readonly or c.name in changed_names:
-            continue
-        if c.audit == "mdate":
-            sets.append(f"t.{q(c.name)} = GETDATE()")
-        elif c.audit == "mby":
-            sets.append(f"t.{q(c.name)} = @u")
+    sets = [f"t.{q(c.name)} = j.[v{i}]" for i, c in enumerate(changed)] + update_audit(table_cols, changed, fill)
     on = " AND ".join(f"t.{q(k.name)} = j.[k{i}]" for i, k in enumerate(keys))
     return (DECL + f"UPDATE t SET {', '.join(sets)} FROM {q(schema)}.{q(name)} t "
            f"JOIN OPENJSON(?) WITH ({with_clause(len(keys), 'k')}, {with_clause(len(changed), 'v')}) j "
            f"ON {on}")
+
+
+def lit(v) -> str:
+    """Python value -> T-SQL literal. Values go to the server as nvarchar either way,
+    so N'...' converts exactly as the OPENJSON value does."""
+    return "NULL" if v is None else "N'" + str(v).replace("'", "''") + "'"
+
+
+def _key_where(keys: list[Col], key_rows: list[list[str]]) -> str:
+    """WHERE matching these key values, as the push matches them (t.key = value)."""
+    if len(keys) == 1:
+        return f"t.{q(keys[0].name)} IN ({', '.join(lit(r[0]) for r in key_rows)})"
+    return "\n   OR ".join("(" + " AND ".join(f"t.{q(k.name)} = {lit(v)}" for k, v in zip(keys, r)) + ")"
+                          for r in key_rows)
+
+
+def _script_head(database, action: str, user: str) -> list[str]:
+    return [f"-- {action}", f"USE {q(database)};", f"DECLARE @u nvarchar(128) = {lit(user)};", ""]
+
+
+def _script_tx(what: str, body: list[str], dry: bool, after: str) -> list[str]:
+    """Change in one transaction, then the rows after it. A dry run reads them
+    before its ROLLBACK, since afterwards nothing of the change is left."""
+    head = [f"-- 2. Change, in one transaction. The app rolls all of it back if {what}",
+            "BEGIN TRANSACTION;", *body]
+    look = ["-- 3. Rows after the change", after] if after else []
+    if dry:
+        return [*head, "", *look, "ROLLBACK TRANSACTION;  -- dry run: validated, nothing kept", ""]
+    return [*head, "COMMIT TRANSACTION;", "", *look, ""]
+
+
+def script_update(database, table, table_cols: list[Col], keys: list[Col], plan, user: str,
+                  dry: bool, fill: bool) -> str:
+    """Readable script with the same effect as the update plan: SELECT the rows,
+    one UPDATE per row with the values pushed, SELECT them again.
+    plan = [(changed cols, payloads [(grid_row, {k0.., v0..})])]"""
+    schema, name = split_table(table)
+    tbl = f"{q(schema)}.{q(name)}"
+    nrows = sum(len(p) for _, p in plan)
+    key_rows = [[p[f"k{j}"] for j in range(len(keys))] for _, ps in plan for _, p in ps]
+    shown, seen = [], set()  # keys, edited columns, audit columns
+    for c in [*keys, *[c for ch, _ in plan for c in ch],
+              *[c for c in table_cols if not c.readonly and c.audit in ("mdate", "mby")]]:
+        if c.name.lower() not in seen:
+            seen.add(c.name.lower())
+            shown.append(c)
+    select = (f"SELECT {', '.join('t.' + q(c.name) for c in shown)}\nFROM {tbl} t\n"
+              f"WHERE {_key_where(keys, key_rows)}\n"
+              f"ORDER BY {', '.join('t.' + q(k.name) for k in keys)};")
+    body = []
+    for changed, payloads in plan:
+        audit = update_audit(table_cols, changed, fill)
+        for gi, p in payloads:
+            sets = [f"t.{q(c.name)} = {lit(p[f'v{i}'])}" for i, c in enumerate(changed)] + audit
+            where = " AND ".join(f"t.{q(k.name)} = {lit(p[f'k{j}'])}" for j, k in enumerate(keys))
+            body.append(f"UPDATE t SET {', '.join(sets)}\n"
+                        f"  FROM {tbl} t WHERE {where};  -- grid row {gi + 1}, expects 1 row")
+    return "\n".join([
+        *_script_head(database, f"{'Dry run: update' if dry else 'Update'} {nrows:,} row"
+                      f"{'s' if nrows != 1 else ''} in {database}.{schema}.{name}", user),
+        "-- 1. Rows as they are now", select, "",
+        *_script_tx("any UPDATE does not affect exactly 1 row", body, dry, select)])
+
+
+def script_insert(database, table, table_cols: list[Col], data_cols: list[Col], payloads,
+                  user: str, dry: bool, fill: bool) -> str:
+    """Readable script with the same effect as the insert: one INSERT per row with
+    the values pushed, plus SELECTs by primary key when the grid supplies it."""
+    schema, name = split_table(table)
+    tbl = f"{q(schema)}.{q(name)}"
+    audit = insert_audit(table_cols, data_cols, fill)
+    autos = [fill and audit_auto(c, INSERT_AUTO) for c in data_cols]
+    tgt = ", ".join([q(c.name) for c in data_cols] + [n for n, _ in audit])
+    pk = [c for c in table_cols if c.is_pk]
+    pos = {c.name: i for i, c in enumerate(data_cols)}
+    has_pk = bool(pk) and all(c.name in pos for c in pk)
+    body = [f"INSERT INTO {tbl} ({tgt})\n  VALUES ("
+            + ", ".join([autos[i] if p[f"v{i}"] is None and autos[i] else lit(p[f"v{i}"])
+                         for i in range(len(data_cols))] + [e for _, e in audit])
+            + f");  -- grid row {gi + 1}" for gi, p in payloads]
+    out = _script_head(database, f"{'Dry run: insert' if dry else 'Insert'} {len(payloads):,} row"
+                       f"{'s' if len(payloads) != 1 else ''} into {database}.{schema}.{name}", user)
+    if has_pk:
+        key_rows = [[p[f"v{pos[c.name]}"] for c in pk] for _, p in payloads]
+        cols = [*pk, *[c for c in data_cols if not c.is_pk]]
+        cols += [c for c in table_cols if audit_auto(c, INSERT_AUTO) and c not in cols]
+        select = (f"SELECT {', '.join('t.' + q(c.name) for c in cols)}"
+                  f"\nFROM {tbl} t\nWHERE {_key_where(pk, key_rows)}\n"
+                  f"ORDER BY {', '.join('t.' + q(k.name) for k in pk)};")
+        out += ["-- 1. Rows with these keys now (expect none)", select, ""]
+    else:
+        select = ""
+        out += ["-- 1. No SELECT before: the primary key is "
+                + ("generated by the server (identity / default)" if pk else "not defined")
+                + "; Load after the insert to see the new rows", ""]
+    out += _script_tx("any row fails", body, dry, select)
+    return "\n".join(out)
+
+
+def script_executed(steps, user: str) -> str:
+    """The statements exactly as sent: SQL text, then each batch's parameters."""
+    out = ["-- Sent as parameterised statements in one transaction.",
+           "-- Parameter 1 (@u) is the user; parameter 2 is a JSON array, one object per row.", ""]
+    for n, (sql, payloads, check) in enumerate(steps, 1):
+        chunks = [payloads[i:i + BATCH] for i in range(0, len(payloads), BATCH)]
+        out += [f"-- Statement {n} of {len(steps)} · {len(payloads):,} rows in {len(chunks)} batch"
+                f"{'es' if len(chunks) != 1 else ''}"]
+        if check:
+            out += ["-- Before each batch, this check runs with param 2 only. Any row it returns",
+                    "-- (key matching 0 or several table rows) stops the push and rolls back all:",
+                    check, "-- then the update; the batch must also affect exactly its row count:"]
+        out += [sql, ""]
+        for b, chunk in enumerate(chunks, 1):
+            out += [f"-- batch {b}: param 1 = {lit(user)}",
+                    f"-- batch {b}: param 2 (grid rows {', '.join(str(gi + 1) for gi, _ in chunk)}) =",
+                    json.dumps([p for _, p in chunk], ensure_ascii=False), ""]
+    return "\n".join(out)
+
+
+def build_match_check(table, keys: list[Col]) -> str:
+    """For update: (index in the json batch, matches) of every row whose key does not
+    match exactly one table row, compared the way the UPDATE joins (t.key = j.k).
+    UPDLOCK, HOLDLOCK keep the matched rows, and the gaps, fixed until commit."""
+    schema, name = split_table(table)
+    on = " AND ".join(f"t.{q(k.name)} = j.[k{i}]" for i, k in enumerate(keys))
+    return (f"SELECT x.i, x.n FROM (SELECT CAST(r.[key] AS int) AS i, "
+            f"(SELECT COUNT(*) FROM {q(schema)}.{q(name)} t WITH (UPDLOCK, HOLDLOCK) WHERE {on}) AS n "
+            f"FROM OPENJSON(?) r CROSS APPLY OPENJSON(r.value) WITH ({with_clause(len(keys), 'k')}) j) x "
+            f"WHERE x.n <> 1 ORDER BY x.i")
 
 
 def dedupe_edits(edited, rows, orig, kpos, names):
@@ -948,12 +1176,89 @@ def _a1(tok: str) -> tuple[int, int, bool]:
     return col_index(letters), int(num) - 1, bool(rabs)
 
 
+def _fx_split(text: str, sep: str) -> list[str]:
+    """Split on `sep` outside quotes, brackets and parentheses."""
+    out, depth, start, i = [], 0, 0, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "'":
+            i = text.find("'", i + 1)
+            while i != -1 and text[i + 1:i + 2] == "'":  # '' inside a string
+                i = text.find("'", i + 2)
+            if i == -1:
+                break
+        elif ch == "[":
+            i = text.find("]", i + 1)
+            if i == -1:
+                break
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == sep and depth == 0:
+            out.append(text[start:i])
+            start = i + 1
+        i += 1
+    out.append(text[start:])
+    return out
+
+
+def fx_amp(text: str) -> str:
+    """Excel's & joins text: a & b & c -> CONCAT(a, b, c), at every level of
+    parentheses (SQL's own & is bitwise AND). CONCAT also turns numbers into text and
+    NULL into nothing, as Excel does."""
+    if "&" not in text:
+        return text
+    out, i, n = [], 0, len(text)
+    while i < n:  # first the insides of parentheses
+        ch = text[i]
+        if ch in "'[":
+            close = "'" if ch == "'" else "]"
+            j = text.find(close, i + 1)
+            while ch == "'" and j != -1 and text[j + 1:j + 2] == "'":
+                j = text.find("'", j + 2)
+            j = n - 1 if j == -1 else j
+            out.append(text[i:j + 1])
+            i = j + 1
+            continue
+        if ch == "(":
+            depth, j = 1, i + 1
+            while j < n and depth:
+                if text[j] == "'":
+                    j = text.find("'", j + 1)
+                    while j != -1 and text[j + 1:j + 2] == "'":
+                        j = text.find("'", j + 2)
+                    if j == -1:
+                        j = n
+                elif text[j] == "[":
+                    j = text.find("]", j + 1)
+                    if j == -1:
+                        j = n
+                elif text[j] == "(":
+                    depth += 1
+                elif text[j] == ")":
+                    depth -= 1
+                j += 1
+            out.append("(" + fx_amp(text[i + 1:j - 1]) + ")" if not depth else text[i:])
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    level = "".join(out)
+    args = []
+    for arg in _fx_split(level, ","):
+        parts = _fx_split(arg, "&")
+        args.append(arg if len(parts) == 1 else
+                    re.match(r"\s*", arg).group() + "CONCAT(" + ", ".join(p.strip() for p in parts) + ")")
+    return ",".join(args)
+
+
 def fx_parse(text: str, gi: int, cols: list["Col"], nrows: int):
     """Formula of data row `gi` -> (pieces, refs, shape). pieces: SQL text and ref
     numbers; refs: ("cell", column, row) or ("agg", FUNC, [(row, column), ...]);
     shape: the formula with references made relative to the row, equal for every
     cell that can share one query (a filled-down formula)."""
-    body, names = text[1:], fx_names(cols)
+    body, names = fx_amp(text[1:]), fx_names(cols)
     pieces: list = []
     refs: list = []
     shape: list[str] = []
@@ -1061,7 +1366,7 @@ def fx_sql(pieces: list, refs: list, cols: list["Col"], cast: str) -> str:
 
 def cell_error(col: "Col", v: str) -> str | None:
     """Why `v` cannot go into `col`, or None when it can. Blank / NULL always can."""
-    if col.external or col.readonly or col.audit or is_formula(v):  # formulas: checked once evaluated
+    if col.external or col.readonly or is_formula(v):  # formulas: checked once evaluated
         return None
     if col.big and v and v.strip().upper() != "NULL":  # unknown values: see App._big_lookups
         if v in col.nomatch:
@@ -1092,7 +1397,8 @@ def col_info(col: "Col") -> str:
     if col.readonly:
         parts.append("read-only")
     elif col.audit:
-        parts.append("set automatically")
+        parts.append(f"left alone: {'GETDATE()' if col.audit in ('cdate', 'mdate') else 'user name'}"
+                     f" on {'insert' if col.audit in INSERT_AUTO else 'update'} (Settings)")
     if col.big:
         parts.append(f"lookup {col.lookup}: labels read per value")
     elif col.choices is not None:
@@ -1632,9 +1938,22 @@ class App:
                 pass
         for t in self.tabs:
             t.sheet.set_options(**sheet_colors())
+        if getattr(self, "assist", None):
+            self.assist.recolor()
         self._draw_tabs()
         self._marks()
         self._place_handle()
+
+    def _assist_where(self):
+        """(connection args, database) the SQL box suggests from, None when offline."""
+        db = self.tab.db
+        if db.cn is None or not db.args:
+            return None
+        return db.args, self.v_db.get() or "master"
+
+    def audit_user(self) -> str:
+        """Name written to CreatedBy / ModifiedBy: Settings, else the OS login."""
+        return self.settings.get("audit_user", "").strip() or self.user
 
     def _toggle_setting(self, key: str):
         self.settings[key] = self.v_set[key].get()
@@ -1726,6 +2045,7 @@ class App:
                                 selectbackground="accent_soft", selectforeground="text")
         self.t_sql.pack(fill="both", expand=True)
         self.t_sql.bind("<Control-Return>", lambda e: (self.run_query(), "break")[1])
+        self.assist = sql_assist.SqlAssist(self.t_sql, sql_assist.Meta(_meta_conn), self._assist_where, C, MONO)
         side = ttk.Frame(self.sql_box)
         side.pack(side="left", fill="y")
         self.b_run = self.with_icon(ttk.Button(side, text="Run", command=self.run_query), "play")
@@ -2079,7 +2399,7 @@ class App:
             label = self.cols[c].key_label.get(self.v_fx.get())
             if label:
                 self.msg(f"{self.cols[c].name} {self.v_fx.get()} = {label}")
-        self.e_fx.state(["readonly"] if self.cols[c].readonly or self.cols[c].audit else ["!readonly"])
+        self.e_fx.state(["readonly"] if self.cols[c].readonly else ["!readonly"])
         self._sel_stats()
 
     def _sel_stats(self):
@@ -2117,7 +2437,7 @@ class App:
         new = self.v_fx.get()
         if new == shown or tab is not self.tab or col not in self.cols:
             return
-        if col.readonly or col.audit:
+        if col.readonly:
             self._fx_cell = (tab, r, col, new)
             return self.msg(f"{col.name} is read-only", error=True)
         if is_formula(new):
@@ -2413,7 +2733,7 @@ class App:
 
     def _writable(self, c: int) -> bool:
         col = self.cols[c]
-        return not (col.readonly or col.audit)
+        return not col.readonly
 
     # column moves: tksheet moves data + headers; keep self.cols / self.orig in step
     def _sync_columns(self):
@@ -3091,7 +3411,7 @@ class App:
         self.sheet.set_sheet_data(data, reset_col_positions=True)
         self.sheet.headers([c.label for c in cols] + ["__rid"])
         self.sheet.display_columns(list(range(n)), all_columns_displayed=False)
-        self.sheet.readonly_columns([i for i, c in enumerate(cols) if c.readonly or c.audit], True)
+        self.sheet.readonly_columns([i for i, c in enumerate(cols) if c.readonly], True)
         self._dropdowns()
         self._fit_columns(data)
         self._marks()
@@ -3388,7 +3708,7 @@ class App:
             if "dropdown" in self.sheet.MT.col_options[i]:
                 self.sheet.del_dropdown(self.sheet.span(num2alpha(i), header=False), redraw=False)
         for i, c in enumerate(self.cols):
-            if c.choices is not None and not (c.readonly or c.audit):
+            if c.choices is not None and not c.readonly:
                 self.sheet.dropdown(self.sheet.span(num2alpha(i), header=False), values=["", *c.choice_list],
                                     edit_data=False, validate_input=False, redraw=False,
                                     search_function=choice_search)
@@ -3494,7 +3814,7 @@ class App:
         self._formulas(rows, new, edited)
         self._big_lookups(rows, new, edited)
         self.sheet.dehighlight_all(redraw=False)
-        ro = [i for i, c in enumerate(self.cols) if c.readonly or c.audit]
+        ro = [i for i, c in enumerate(self.cols) if c.readonly]
         if ro:
             self.sheet.highlight_columns(ro, bg=C["readonly"], redraw=False)
         for gi, _ in new:
@@ -3578,7 +3898,7 @@ class App:
         pos = {id(r): gi for gi, r in enumerate(data)}
         for k in [k for k, (row, _) in t.fx.items() if pos.get(k) is None or data[pos[k]] is not row]:
             del t.fx[k]  # row deleted, or the grid reloaded
-        ok = {ci for ci, c in enumerate(self.cols) if not (c.external or c.readonly or c.audit)}
+        ok = {ci for ci, c in enumerate(self.cols) if not (c.external or c.readonly)}
         entered = [(gi, ci) for gi, _ in new for ci in ok] + [(gi, ci) for gi, _, ch in edited for ci in ch if ci in ok]
         local = [ci for ci, c in enumerate(self.cols) if c.scratch]
         entered += [(gi, ci) for ci in local for gi, r in enumerate(rows) if is_formula(r[ci])]
@@ -3800,7 +4120,7 @@ class App:
         a new row, and the changed cells of an edited row."""
         bad = {}
         checked = [(ci, col) for ci, col in enumerate(self.cols)
-                   if not (col.external or col.readonly or col.audit)]
+                   if not (col.external or col.readonly)]
         for gi, vals in new:
             for ci, col in checked:
                 v = vals[ci]
@@ -3877,7 +4197,7 @@ class App:
         self.sheet.set_sheet_data(data, reset_col_positions=False)
         self.sheet.display_columns(list(range(n)), all_columns_displayed=False,
                                   reset_col_positions=False)
-        self.sheet.readonly_columns([i for i, c in enumerate(self.cols) if c.readonly or c.audit], True)
+        self.sheet.readonly_columns([i for i, c in enumerate(self.cols) if c.readonly], True)
         self._marks()
         note = f" · ignored columns: {', '.join(unknown)}" if unknown else ""
         self.msg(f"Added {len(add):,} rows from {source}{note}")
@@ -3946,7 +4266,8 @@ class App:
         if not new:
             return self.msg("No new rows. New rows are the green ones without a DB origin.")
         dry = self.v_dry.get()
-        sql, data_cols = build_insert(self.table, self.cols, self.table_cols)
+        fill, user = self.settings["audit_fill"], self.audit_user()
+        sql, data_cols = build_insert(self.table, self.cols, self.table_cols, fill)
         pos = [self.cols.index(c) for c in data_cols]
         payloads = [(gi, {f"v{j}": nz(vals[p]) for j, p in enumerate(pos)}) for gi, vals in new]
         database = self.database
@@ -3955,18 +4276,21 @@ class App:
             dlg = ReviewDialog(
                 self.root, "Review insert",
                 f"{len(new):,} new rows into {database}.{self.table}. Every value below is new; "
-                "blank = NULL. Audit columns are filled on the server.",
+                "blank = NULL" + (", blank Created date / by = GETDATE() / user name." if fill else "."),
                 ["Grid row", *[c.name for c in data_cols]],
                 [[gi + 1, *[vals[i] for i in pos]] for gi, vals in new],
                 {i + 1: "new" for i in range(len(data_cols))},
-                f"{verb} {len(new):,} row{'s' if len(new) != 1 else ''}")
+                f"{verb} {len(new):,} row{'s' if len(new) != 1 else ''}",
+                {"SQL": script_insert(database, self.table, self.table_cols, data_cols, payloads,
+                                      user, dry, fill),
+                 "Executed": script_executed([(sql, payloads, None)], user)})
             if not dlg.ok:
                 return self.msg("Insert cancelled")
 
         db = self.db
 
         def work():
-            return db.write(database, [(sql, payloads, False)], self.user, dry)
+            return db.write(database, [(sql, payloads, None)], user, dry)
 
         def done(_n, secs):
             if dry:
@@ -4005,17 +4329,20 @@ class App:
         groups: dict[tuple, list] = {}
         for gi, rid, ch in edited:
             groups.setdefault(tuple(ch), []).append((gi, rid))
-        plan = []
+        plan, script_plan = [], []
+        check = build_match_check(self.table, self.keys)
+        fill, user = self.settings["audit_fill"], self.audit_user()
         for ch, members in groups.items():
             changed = [self.cols[i] for i in ch]
-            sql = build_update(self.table, self.table_cols, self.keys, changed)
+            sql = build_update(self.table, self.table_cols, self.keys, changed, fill)
             payloads = []
             for gi, rid in members:
                 o = self.orig[rid]
                 p = {f"k{j}": o[kp] for j, kp in enumerate(kpos)}
                 p.update({f"v{j}": nz(rows[gi][ci]) for j, ci in enumerate(ch)})
                 payloads.append((gi, p))
-            plan.append((sql, payloads, True))
+            plan.append((sql, payloads, check))
+            script_plan.append((changed, payloads))
         database = self.database
         lines = [[gi + 1, *[self.orig[rid][kp] for kp in kpos], self.cols[ci].name,
                   self.orig[rid][ci], rows[gi][ci]] for gi, rid, ch in edited for ci in ch]
@@ -4025,17 +4352,21 @@ class App:
             dlg = ReviewDialog(
                 self.root, "Review update",
                 f"{len(edited):,} rows, {len(lines):,} cells in {database}.{self.table}. "
-                "Only these cells are written; blank = NULL.",
+                "Only these cells are written; blank = NULL."
+                + (" Modified date / by not edited by hand = GETDATE() / user name." if fill else ""),
                 ["Grid row", *[k.name for k in self.keys], "Column", "Old value", "New value"],
                 lines, {nk + 2: "old", nk + 3: "new"},
-                f"{verb} {len(edited):,} row{'s' if len(edited) != 1 else ''}")
+                f"{verb} {len(edited):,} row{'s' if len(edited) != 1 else ''}",
+                {"SQL": script_update(database, self.table, self.table_cols, self.keys, script_plan,
+                                      user, dry, fill),
+                 "Executed": script_executed(plan, user)})
             if not dlg.ok:
                 return self.msg("Update cancelled")
 
         db = self.db
 
         def work():
-            return db.write(database, plan, self.user, dry)
+            return db.write(database, plan, user, dry)
 
         def done(n, secs):
             if dry:
@@ -4788,8 +5119,26 @@ class SettingsDialog(tk.Toplevel):
                                     save_settings(app.settings),
                                     app.msg("Lookups reset to automatic; applies on the next Load"))
                    ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 12))
-        ttk.Label(f, text=f"Version {VERSION}", style="Group.TLabel").grid(row=14, column=0, sticky="w")
-        ttk.Button(f, text="Close", command=self.destroy).grid(row=14, column=1, sticky="e")
+        ttk.Label(f, text="Audit columns", style="Group.TLabel").grid(row=14, column=0, columnspan=2, sticky="w")
+        self.v_fill = tk.BooleanVar(value=app.settings.get("audit_fill", True))
+        ttk.Checkbutton(f, text="Fill audit columns left alone", variable=self.v_fill,
+                        command=lambda: (app.settings.__setitem__("audit_fill", self.v_fill.get()),
+                                         save_settings(app.settings))
+                        ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(f, text="User name").grid(row=16, column=0, sticky="w", padx=(0, 12), pady=3)
+        self.v_user = tk.StringVar(value=app.settings.get("audit_user", ""))
+        e = ttk.Entry(f, textvariable=self.v_user, width=24)
+        e.grid(row=16, column=1, sticky="w", pady=3)
+        Hint(app, e, self.v_user, app.user)
+        self.v_user.trace_add("write", lambda *a: (app.settings.__setitem__("audit_user", self.v_user.get().strip()),
+                                                   save_settings(app.settings)))
+        ttk.Label(f, text="Insert: blank Created date / by = GETDATE() / user name.\n"
+                         "Update: Modified date / by not edited by hand = GETDATE() / user name.\n"
+                         "A value you type is written as typed. Off: only typed values are written.",
+                  style="Group.TLabel", justify="left").grid(row=17, column=0, columnspan=2,
+                                                            sticky="w", pady=(2, 12))
+        ttk.Label(f, text=f"Version {VERSION}", style="Group.TLabel").grid(row=18, column=0, sticky="w")
+        ttk.Button(f, text="Close", command=self.destroy).grid(row=18, column=1, sticky="e")
         self.bind("<Escape>", lambda e: self.destroy())
         modal(self)
 
@@ -5045,20 +5394,47 @@ class FilterDialog(tk.Toplevel):
 
 class ReviewDialog(tk.Toplevel):
     """Show what a push will write and ask for confirmation. `fills` maps a column
-    index to a palette key used to tint that whole column (old / new)."""
+    index to a palette key used to tint that whole column (old / new). `sql` adds
+    a tab per entry {tab name: script}, read-only text with a Copy button."""
 
     def __init__(self, parent, title: str, summary: str, headers: list[str], rows: list[list],
-                 fills: dict[int, str], action: str):
+                 fills: dict[int, str], action: str, sql: dict[str, str] | None = None):
         super().__init__(parent)
         self.title(title)
         self.configure(bg=C["surface"])
         self.ok = False
         self.transient(parent)
-        self.geometry("980x560")
+        self.geometry("1080x620")
         ttk.Label(self, text=summary, padding=(16, 14, 16, 10), foreground=C["text"]
                   ).pack(anchor="w")
-        wrap = tk.Frame(self, bg=C["line"], padx=1, pady=1)
-        wrap.pack(fill="both", expand=True, padx=16)
+        tabs = ttk.Frame(self, padding=(16, 0, 16, 8))
+        tabs.pack(fill="x")
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=16)
+        wrap = tk.Frame(body, bg=C["line"], padx=1, pady=1)
+        self.panes: dict[str, tuple[tk.Frame, tk.Text | None]] = {"Changes": (wrap, None)}
+        for name, text in (sql or {}).items():
+            fr = tk.Frame(body, bg=C["line"], padx=1, pady=1)
+            t = tk.Text(fr, wrap="none", font=MONO, bg=C["surface"], fg=C["text"], relief="flat",
+                        highlightthickness=0, padx=8, pady=6, selectbackground=C["accent_soft"],
+                        selectforeground=C["text"], inactiveselectbackground=C["accent_soft"])
+            sy = ttk.Scrollbar(fr, orient="vertical", command=t.yview)
+            sx = ttk.Scrollbar(fr, orient="horizontal", command=t.xview)
+            t.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+            sy.pack(side="right", fill="y")
+            sx.pack(side="bottom", fill="x")
+            t.pack(fill="both", expand=True)
+            t.tag_configure("comment", foreground=C["muted"])
+            for ln in text.splitlines():
+                t.insert("end", ln + "\n", "comment" if ln.lstrip().startswith("--") else "")
+            t.configure(state="disabled")  # still selectable and copyable
+            t.bind("<Button-1>", lambda e, t=t: t.focus_set())
+            self.panes[name] = (fr, t)
+        self.b_tabs = {}
+        for name in self.panes if len(self.panes) > 1 else ():
+            b = ttk.Button(tabs, text=name, command=lambda n=name: self._show(n))
+            b.pack(side="left", padx=(0, 6))
+            self.b_tabs[name] = b
         sh = Sheet(wrap, data=rows, headers=headers, font=(CELL[0], CELL[1], "normal"),
                    header_font=(CELL[0], CELL[1], "normal"), index_font=(CELL[0], CELL[1], "normal"),
                    default_row_height=22, show_x_scrollbar=True, **sheet_colors())
@@ -5073,9 +5449,38 @@ class ReviewDialog(tk.Toplevel):
         bar.pack(fill="x")
         ttk.Button(bar, text=action, style="Primary.TButton", command=self._yes).pack(side="right")
         ttk.Button(bar, text="Cancel", command=self.destroy).pack(side="right", padx=8)
+        self.b_copy = ttk.Button(bar, text="Copy SQL", style="Tool.TButton", command=self._copy)
+        self.b_copy.pack(side="left")
         self.bind("<Escape>", lambda e: self.destroy())
+        self.current = ""
+        self._show("Changes")
         modal(self)
         self.wait_window()
+
+    def _show(self, name: str):
+        for n, (fr, _) in self.panes.items():
+            fr.pack_forget()
+            if n in self.b_tabs:
+                self.b_tabs[n].configure(style="Primary.TButton" if n == name else "Tool.TButton")
+        self.panes[name][0].pack(fill="both", expand=True)
+        self.current = name
+        if self.panes[name][1] is None:
+            self.b_copy.pack_forget()
+        else:
+            self.b_copy.pack(side="left")
+
+    def _copy(self):
+        t = self.panes[self.current][1]
+        if t is None:
+            return
+        try:
+            text = t.get("sel.first", "sel.last")
+        except tk.TclError:  # nothing selected: the whole script
+            text = t.get("1.0", "end-1c")
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.b_copy.configure(text="Copied")
+        self.after(1200, lambda: self.b_copy.winfo_exists() and self.b_copy.configure(text="Copy SQL"))
 
     def _yes(self):
         self.ok = True

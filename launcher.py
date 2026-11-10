@@ -38,7 +38,7 @@ ASSET = "AbsoluteQuery.exe" if os.name == "nt" else "AbsoluteQuery-linux"
 TIMEOUT = 5  # seconds per check; a slow or missing server never blocks start-up for long
 DOWNLOAD_TIMEOUT = 120
 ENTRY = "absolute_query"  # module whose main() is the app
-APP_MODULES = ("absolute_query", "connections", "excel_ops", "icons")
+APP_MODULES = ("absolute_query", "connections", "excel_ops", "icons", "sql_assist")
 KEEP = 2  # unpacked versions kept: current + previous
 
 
